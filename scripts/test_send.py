@@ -78,9 +78,7 @@ def main():
                         help="SMTP-verify each address before generating emails")
     args = parser.parse_args()
 
-    # Claude generates real emails regardless of DRY_RUN env var
-    # We temporarily override for generation only
-    _original_dry_run = config.DRY_RUN
+    # This script always generates real emails and sends for real — ignore DRY_RUN env var
     config.DRY_RUN = False
 
     claude = ClaudeClient()
@@ -94,8 +92,6 @@ def main():
             sys.exit(1)
     else:
         gmail = None
-
-    config.DRY_RUN = _original_dry_run  # restore for Gmail (won't matter without --send)
 
     print(f"\n{DIVIDER}")
     print(f"  Inara AI — End-to-End Test   (Email #{args.email})")
@@ -139,7 +135,6 @@ def main():
         if args.send:
             confirm = input(f"\n  Send this to {email_addr}? [y/N] ").strip().lower()
             if confirm == "y":
-                config.DRY_RUN = False
                 sent = gmail.send_email(to=email_addr, subject=subject, body=body)
                 if sent:
                     print(f"  → Sent to {email_addr}")
