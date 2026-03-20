@@ -155,9 +155,7 @@ class TestFindEmailsForDomain:
 
 
 class TestBestContact:
-    @patch("src.snov_client.requests.get")
-    @patch("src.snov_client.requests.post")
-    def test_prefers_target_title(self, mock_post, mock_get):
+    def _mock_post_get(self, mock_post, mock_get, result_data: list[dict]):
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
@@ -169,10 +167,14 @@ class TestBestContact:
         mock_post.side_effect = [auth_resp, start_resp]
 
         result_resp = MagicMock()
-        result_resp.json.return_value = MOCK_RESULT_RESPONSE
+        result_resp.json.return_value = {"data": result_data}
         result_resp.raise_for_status = MagicMock()
         mock_get.return_value = result_resp
 
+    @patch("src.snov_client.requests.get")
+    @patch("src.snov_client.requests.post")
+    def test_prefers_target_title_over_generic(self, mock_post, mock_get):
+        self._mock_post_get(mock_post, mock_get, MOCK_RESULT_RESPONSE["data"])
         client = SnovClient(client_id="id", client_secret="secret")
         best = client.best_contact("northtexasortho.com")
         assert best is not None
@@ -180,27 +182,38 @@ class TestBestContact:
 
     @patch("src.snov_client.requests.get")
     @patch("src.snov_client.requests.post")
-    def test_falls_back_to_first_contact(self, mock_post, mock_get):
-        auth_resp = MagicMock()
-        auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
-        auth_resp.raise_for_status = MagicMock()
+    def test_prefers_personal_over_generic_when_no_title(self, mock_post, mock_get):
+        # scheduling@ is generic, jdoe@ is personal — personal wins even without title
+        data = [
+            {"email": "scheduling@clinic.com", "firstName": "", "lastName": "", "currentJob": [], "confidence": "high"},
+            {"email": "jdoe@clinic.com", "firstName": "Jane", "lastName": "Doe", "currentJob": [], "confidence": "medium"},
+        ]
+        self._mock_post_get(mock_post, mock_get, data)
+        client = SnovClient(client_id="id", client_secret="secret")
+        best = client.best_contact("clinic.com")
+        assert best is not None
+        assert best["email"] == "jdoe@clinic.com"
 
-        start_resp = MagicMock()
-        start_resp.json.return_value = MOCK_START_RESPONSE
-        start_resp.raise_for_status = MagicMock()
+    @patch("src.snov_client.requests.get")
+    @patch("src.snov_client.requests.post")
+    def test_prefers_higher_confidence_among_same_tier(self, mock_post, mock_get):
+        # Both personal, but one is high confidence — high wins
+        data = [
+            {"email": "asmith@clinic.com", "firstName": "A", "lastName": "Smith", "currentJob": [], "confidence": "low"},
+            {"email": "bjones@clinic.com", "firstName": "B", "lastName": "Jones", "currentJob": [], "confidence": "high"},
+        ]
+        self._mock_post_get(mock_post, mock_get, data)
+        client = SnovClient(client_id="id", client_secret="secret")
+        best = client.best_contact("clinic.com")
+        assert best["email"] == "bjones@clinic.com"
 
-        mock_post.side_effect = [auth_resp, start_resp]
-
-        no_title_response = {
-            "data": [
-                {"email": "info@clinic.com", "firstName": "Info", "lastName": "", "currentJob": [], "confidence": "low"},
-            ]
-        }
-        result_resp = MagicMock()
-        result_resp.json.return_value = no_title_response
-        result_resp.raise_for_status = MagicMock()
-        mock_get.return_value = result_resp
-
+    @patch("src.snov_client.requests.get")
+    @patch("src.snov_client.requests.post")
+    def test_falls_back_to_generic_when_only_option(self, mock_post, mock_get):
+        data = [
+            {"email": "info@clinic.com", "firstName": "", "lastName": "", "currentJob": [], "confidence": "low"},
+        ]
+        self._mock_post_get(mock_post, mock_get, data)
         client = SnovClient(client_id="id", client_secret="secret")
         best = client.best_contact("clinic.com")
         assert best is not None

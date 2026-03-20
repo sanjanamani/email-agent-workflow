@@ -37,6 +37,16 @@ TARGET_TITLES: list[str] = [
     "clinic administrator",
 ]
 
+# Generic inbox prefixes — these reach no specific person and should be
+# used only as a last resort.
+GENERIC_PREFIXES: tuple[str, ...] = (
+    "info", "contact", "hello", "support", "help", "admin",
+    "office", "scheduling", "appointments", "billing",
+    "reception", "general", "noreply", "no-reply",
+)
+
+CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
 
 class SnovClient:
     """Thin wrapper around the Snov.io REST API (v2)."""
@@ -160,14 +170,44 @@ class SnovClient:
     # ------------------------------------------------------------------
 
     def best_contact(self, domain: str) -> Optional_dict:
-        """Return the single best contact for a domain (target title first, else first)."""
+        """
+        Return the single best contact for a domain.
+
+        Priority:
+        1. Target-title match (office manager, billing, etc.) — highest confidence first
+        2. Personal email (non-generic prefix) — highest confidence first
+        3. Generic inbox (info@, scheduling@, etc.) — highest confidence first
+        4. None if everything is low-confidence and generic
+
+        Low-confidence emails are only used when nothing better exists.
+        """
         contacts = self.find_emails_for_domain(domain)
         if not contacts:
             return None
-        for contact in contacts:
-            if any(t in contact.get("title", "").lower() for t in TARGET_TITLES):
-                return contact
-        return contacts[0]
+
+        def _is_generic(contact: dict) -> bool:
+            local = contact["email"].split("@")[0].lower()
+            return local in GENERIC_PREFIXES
+
+        def _conf_rank(contact: dict) -> int:
+            return CONFIDENCE_RANK.get(contact.get("confidence", "low"), 2)
+
+        def _has_target_title(contact: dict) -> bool:
+            return any(t in contact.get("title", "").lower() for t in TARGET_TITLES)
+
+        # Sort: (no target title, is generic, confidence rank) — lower is better
+        ranked = sorted(
+            contacts,
+            key=lambda c: (not _has_target_title(c), _is_generic(c), _conf_rank(c)),
+        )
+
+        best = ranked[0]
+        logger.debug(
+            "Selected contact %s <%s> title=%r confidence=%s generic=%s",
+            best["full_name"], best["email"], best["title"],
+            best.get("confidence"), _is_generic(best),
+        )
+        return best
 
 
 # ---------------------------------------------------------------------------
