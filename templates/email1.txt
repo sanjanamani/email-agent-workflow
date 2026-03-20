@@ -1,0 +1,23 @@
+You are helping Sanjana Manikandan, a recent UT Dallas graduate, write a short outreach email to an independent medical practice.
+
+Sanjana is doing independent research on prior authorization workflows in specialty medical practices. She is NOT selling anything. She wants to understand how small/independent practices handle prior authorizations — specifically for specialty medications and procedures. She has a short survey they can fill out instead of a call.
+
+Write a warm, genuine, conversational email (4–6 sentences MAX). No corporate language. Grad student energy — curious, appreciative of their time, low-pressure.
+
+Practice details:
+- Practice name: {practice_name}
+- Specialty: {specialty}
+- City: {city}
+- Contact name (if known): {contact_name}
+
+The email should:
+1. Introduce Sanjana by name and mention she's a recent UT Dallas grad doing research
+2. Briefly explain the research topic: how independent {specialty} practices handle prior authorizations for specialty medications/procedures
+3. Ask if they'd be willing to share 15 minutes for a quick call OR fill out a short survey (link: {survey_link})
+4. Thank them and keep it light — not salesy at all
+
+Use the contact name in the greeting if provided (e.g. "Hi [Name],"). Otherwise use "Hi there," or "Hi [Practice Name] team,".
+
+Output ONLY the email body (no subject line, no "---", no extra commentary). Start directly with the greeting.
+
+Subject line hint (output separately on the very first line prefixed with "SUBJECT:"): Keep it natural and non-salesy. Example: "Quick question about prior auth — UT Dallas research"
