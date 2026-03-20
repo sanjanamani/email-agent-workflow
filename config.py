@@ -7,6 +7,9 @@ should call os.getenv() directly.
 
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging — stdout so Render captures it
