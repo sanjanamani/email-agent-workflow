@@ -13,8 +13,13 @@ from src.snov_client import SnovClient, _normalize_domain
 
 MOCK_TOKEN_RESPONSE = {"access_token": "test_token_abc"}
 
-MOCK_EMAILS_RESPONSE = {
-    "emails": [
+MOCK_START_RESPONSE = {
+    "meta": {"task_hash": "abc123"},
+    "links": {"result": "https://api.snov.io/v2/domain-search/domain-emails/result/abc123"},
+}
+
+MOCK_RESULT_RESPONSE = {
+    "data": [
         {
             "email": "jennifer.smith@northtexasortho.com",
             "firstName": "Jennifer",
@@ -32,7 +37,7 @@ MOCK_EMAILS_RESPONSE = {
     ]
 }
 
-MOCK_NO_EMAILS_RESPONSE = {"emails": []}
+MOCK_EMPTY_RESULT_RESPONSE = {"data": []}
 
 
 # ---------------------------------------------------------------------------
@@ -78,17 +83,21 @@ class TestFindEmailsForDomain:
     @patch("src.snov_client.requests.get")
     @patch("src.snov_client.requests.post")
     def test_returns_contacts_on_success(self, mock_post, mock_get):
-        # Auth
+        # First POST = auth, second POST = start search
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
 
-        # Domain search
-        search_resp = MagicMock()
-        search_resp.json.return_value = MOCK_EMAILS_RESPONSE
-        search_resp.raise_for_status = MagicMock()
-        mock_get.return_value = search_resp
+        start_resp = MagicMock()
+        start_resp.json.return_value = MOCK_START_RESPONSE
+        start_resp.raise_for_status = MagicMock()
+
+        mock_post.side_effect = [auth_resp, start_resp]
+
+        result_resp = MagicMock()
+        result_resp.json.return_value = MOCK_RESULT_RESPONSE
+        result_resp.raise_for_status = MagicMock()
+        mock_get.return_value = result_resp
 
         client = SnovClient(client_id="id", client_secret="secret")
         contacts = client.find_emails_for_domain("northtexasortho.com")
@@ -104,12 +113,17 @@ class TestFindEmailsForDomain:
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
 
-        search_resp = MagicMock()
-        search_resp.json.return_value = MOCK_NO_EMAILS_RESPONSE
-        search_resp.raise_for_status = MagicMock()
-        mock_get.return_value = search_resp
+        start_resp = MagicMock()
+        start_resp.json.return_value = MOCK_START_RESPONSE
+        start_resp.raise_for_status = MagicMock()
+
+        mock_post.side_effect = [auth_resp, start_resp]
+
+        result_resp = MagicMock()
+        result_resp.json.return_value = MOCK_EMPTY_RESULT_RESPONSE
+        result_resp.raise_for_status = MagicMock()
+        mock_get.return_value = result_resp
 
         client = SnovClient(client_id="id", client_secret="secret")
         contacts = client.find_emails_for_domain("emptydomain.com")
@@ -122,7 +136,12 @@ class TestFindEmailsForDomain:
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
+
+        start_resp = MagicMock()
+        start_resp.raise_for_status = MagicMock()
+        start_resp.json.side_effect = req.RequestException("timeout")
+
+        mock_post.side_effect = [auth_resp, start_resp]
         mock_get.side_effect = req.RequestException("timeout")
 
         client = SnovClient(client_id="id", client_secret="secret")
@@ -142,16 +161,20 @@ class TestBestContact:
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
 
-        search_resp = MagicMock()
-        search_resp.json.return_value = MOCK_EMAILS_RESPONSE
-        search_resp.raise_for_status = MagicMock()
-        mock_get.return_value = search_resp
+        start_resp = MagicMock()
+        start_resp.json.return_value = MOCK_START_RESPONSE
+        start_resp.raise_for_status = MagicMock()
+
+        mock_post.side_effect = [auth_resp, start_resp]
+
+        result_resp = MagicMock()
+        result_resp.json.return_value = MOCK_RESULT_RESPONSE
+        result_resp.raise_for_status = MagicMock()
+        mock_get.return_value = result_resp
 
         client = SnovClient(client_id="id", client_secret="secret")
         best = client.best_contact("northtexasortho.com")
-        # Jennifer Smith with title "Office Manager" should be preferred
         assert best is not None
         assert best["email"] == "jennifer.smith@northtexasortho.com"
 
@@ -161,18 +184,22 @@ class TestBestContact:
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
 
-        # No target-title contacts
+        start_resp = MagicMock()
+        start_resp.json.return_value = MOCK_START_RESPONSE
+        start_resp.raise_for_status = MagicMock()
+
+        mock_post.side_effect = [auth_resp, start_resp]
+
         no_title_response = {
-            "emails": [
+            "data": [
                 {"email": "info@clinic.com", "firstName": "Info", "lastName": "", "currentJob": [], "confidence": "low"},
             ]
         }
-        search_resp = MagicMock()
-        search_resp.json.return_value = no_title_response
-        search_resp.raise_for_status = MagicMock()
-        mock_get.return_value = search_resp
+        result_resp = MagicMock()
+        result_resp.json.return_value = no_title_response
+        result_resp.raise_for_status = MagicMock()
+        mock_get.return_value = result_resp
 
         client = SnovClient(client_id="id", client_secret="secret")
         best = client.best_contact("clinic.com")
@@ -185,12 +212,17 @@ class TestBestContact:
         auth_resp = MagicMock()
         auth_resp.json.return_value = MOCK_TOKEN_RESPONSE
         auth_resp.raise_for_status = MagicMock()
-        mock_post.return_value = auth_resp
 
-        search_resp = MagicMock()
-        search_resp.json.return_value = MOCK_NO_EMAILS_RESPONSE
-        search_resp.raise_for_status = MagicMock()
-        mock_get.return_value = search_resp
+        start_resp = MagicMock()
+        start_resp.json.return_value = MOCK_START_RESPONSE
+        start_resp.raise_for_status = MagicMock()
+
+        mock_post.side_effect = [auth_resp, start_resp]
+
+        result_resp = MagicMock()
+        result_resp.json.return_value = MOCK_EMPTY_RESULT_RESPONSE
+        result_resp.raise_for_status = MagicMock()
+        mock_get.return_value = result_resp
 
         client = SnovClient(client_id="id", client_secret="secret")
         best = client.best_contact("emptydomain.com")
