@@ -1,10 +1,6 @@
 # Inara AI Email Agent — pinned dependencies
 # Python 3.11
 
-# Cryptography (explicit pin to avoid system package conflicts)
-cffi==1.17.1
-cryptography==43.0.3
-
 # Google APIs
 google-api-python-client==2.139.0
 google-auth==2.35.0
