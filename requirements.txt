@@ -8,11 +8,14 @@ google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 
 # Anthropic Claude
-anthropic==0.34.2
+anthropic>=0.40.0
 
 # HTTP
 requests==2.32.3
 urllib3==2.2.3
+
+# DNS (for SMTP mailbox verification)
+dnspython==2.7.0
 
 # Environment
 python-dotenv==1.0.1
