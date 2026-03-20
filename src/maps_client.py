@@ -6,11 +6,11 @@ medical practices across DFW cities. Returns practice dicts with name,
 address, website, phone, and place_id.
 
 SerpAPI free plan: 100 searches/month — plenty for this workflow.
+Sign up at https://serpapi.com and copy your API key.
 """
 
 import logging
 import time
-from typing import Optional
 
 import requests
 
@@ -47,12 +47,11 @@ def search_practices(query: str, api_key: str = "") -> list[dict]:
         return results
 
     if "error" in data:
-        logger.warning("SerpAPI returned error for query=%r: %s", query, data["error"])
+        logger.warning("SerpAPI error for query=%r: %s", query, data["error"])
         return results
 
     for place in data.get("local_results", []):
-        practice = _parse_place(place)
-        results.append(practice)
+        results.append(_parse_place(place))
         if len(results) >= config.MAPS_MAX_RESULTS_PER_QUERY:
             break
 
@@ -62,8 +61,8 @@ def search_practices(query: str, api_key: str = "") -> list[dict]:
 
 def enrich_with_details(practice: dict, api_key: str = "") -> dict:
     """
-    SerpAPI already returns phone and website in the local_results,
-    so this is a no-op kept for compatibility with main.py.
+    No-op: SerpAPI already returns phone and website in local_results.
+    Kept so main.py doesn't need to change.
     """
     return practice
 
@@ -89,8 +88,7 @@ def search_all_queries(api_key: str = "") -> list[dict]:
                 seen_place_ids.add(pid)
                 all_practices.append(practice)
 
-        # Be polite to the API — small delay between queries
-        time.sleep(1)
+        time.sleep(1)  # be polite to the API
 
     logger.info("Total unique practices found across all queries: %d", len(all_practices))
     return all_practices
@@ -117,10 +115,12 @@ def _parse_place(place: dict) -> dict:
     }
 
 
-def _infer_specialty(name: str) -> str:
+def _infer_specialty(name: str, types: list | None = None) -> str:
     """
     Best-effort specialty label based on practice name.
     Returns 'Endocrinology', 'Orthopedics', or 'General'.
+    The optional `types` parameter is accepted but unused (SerpAPI type
+    values are too generic to be useful here).
     """
     name_lower = name.lower()
     if any(k in name_lower for k in ("endocrin", "diabetes", "thyroid", "hormone")):
