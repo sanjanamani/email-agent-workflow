@@ -30,7 +30,7 @@ if DRY_RUN:
 # ---------------------------------------------------------------------------
 # API credentials
 # ---------------------------------------------------------------------------
-GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_API_KEY", "")
+SERPAPI_KEY: str = os.getenv("SERPAPI_KEY", "")
 SNOV_CLIENT_ID: str = os.getenv("SNOV_CLIENT_ID", "")
 SNOV_CLIENT_SECRET: str = os.getenv("SNOV_CLIENT_SECRET", "")
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
