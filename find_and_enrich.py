@@ -3,7 +3,9 @@ find_and_enrich.py — Orchestrates practice discovery, email scraping,
 Claude validation, and routing to Brevo or call_list.csv.
 
 Pipeline:
-  1. Claude finds practices via web search (one call per specialty, all cities)
+  1a. NPI Registry finds authoritative practices (no API key needed)
+  1b. Claude finds additional practices via training knowledge
+      NPI data is merged first; Claude fills in anything NPI misses.
   2. Serper fills gaps (phone, website, address) where missing
   3. Scrape each practice website for candidate email addresses
   4. Claude validates emails and flags fax numbers (single batch call)
@@ -32,7 +34,8 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from claude_finder import find_all_practices
+from claude_finder import find_all_practices, CITIES
+from npi_client import fetch_npi_practices
 from serper_enricher import enrich_practice
 
 load_dotenv()
@@ -431,25 +434,52 @@ def run() -> None:
     counts = {"added": 0, "call_list": 0, "duplicate": 0, "error": 0}
 
     # -------------------------------------------------------------------
-    # STEP 1 — Claude finds practices
+    # STEP 1a — NPI Registry (authoritative, no API key needed)
     # -------------------------------------------------------------------
-    log.info("\n--- STEP 1: Claude finding practices ---")
+    log.info("\n--- STEP 1a: NPI Registry ---")
     all_practices: list[dict] = []
     seen_phones: set[str] = set()
     seen_domains: set[str] = set()
 
+    for specialty in SPECIALTIES:
+        for p in fetch_npi_practices(specialty, CITIES):
+            if len(all_practices) >= MAX_PRACTICES:
+                log.info("MAX_PRACTICES=%d reached, stopping NPI fetch", MAX_PRACTICES)
+                break
+            if is_duplicate(p, seen_phones, seen_domains):
+                log.debug("  skip duplicate (NPI): %s", p.get("name"))
+                continue
+            register(p, seen_phones, seen_domains)
+            all_practices.append(p)
+            log.info(
+                "  [NPI] + %s (%s, %s) — total: %d",
+                p.get("name"), p.get("specialty"), p.get("city"), len(all_practices),
+            )
+
+    log.info("NPI found %d unique practices", len(all_practices))
+
+    # -------------------------------------------------------------------
+    # STEP 1b — Claude finds additional practices
+    # NPI data already registered in seen_phones/seen_domains so Claude
+    # results that duplicate NPI entries are dropped automatically.
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 1b: Claude finding additional practices ---")
+
     for p in find_all_practices(SPECIALTIES):
         if len(all_practices) >= MAX_PRACTICES:
-            log.info("MAX_PRACTICES=%d reached, stopping search", MAX_PRACTICES)
+            log.info("MAX_PRACTICES=%d reached, stopping Claude search", MAX_PRACTICES)
             break
         if is_duplicate(p, seen_phones, seen_domains):
-            log.debug("  skip duplicate: %s", p.get("name"))
+            log.debug("  skip duplicate (Claude): %s", p.get("name"))
             continue
         register(p, seen_phones, seen_domains)
         all_practices.append(p)
-        log.info("  + %s (%s, %s) — total: %d", p.get("name"), p.get("specialty"), p.get("city"), len(all_practices))
+        log.info(
+            "  [Claude] + %s (%s, %s) — total: %d",
+            p.get("name"), p.get("specialty"), p.get("city"), len(all_practices),
+        )
 
-    log.info("Claude found %d unique practices", len(all_practices))
+    log.info("Combined total after NPI + Claude: %d unique practices", len(all_practices))
     log.info("Waiting 180s for token bucket to refill before validation…")
     time.sleep(180)
 
