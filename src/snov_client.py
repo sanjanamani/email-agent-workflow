@@ -1,26 +1,25 @@
 """
-snov_client.py — Snov.io API client for email discovery.
+snov_client.py — Website email scraper using BeautifulSoup and requests.
 
-Uses the v2 Domain Search endpoint (two-step async) to find email
-addresses associated with a practice's website domain.
+Scrapes each practice's website URL — checks the homepage, /contact, and /about
+pages for email addresses using regex on mailto: links and plain email patterns.
 
-API docs: https://snov.io/api
+Class and function signatures are preserved from the original Snov.io client
+for drop-in compatibility with the rest of the codebase.
 """
 
 import logging
-import time
+import re
 from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 import config
 
 logger = logging.getLogger("snov_client")
 
 Optional_dict = dict | None
-
-SNOV_AUTH_URL = "https://api.snov.io/v1/oauth/access_token"
-SNOV_V2_BASE = "https://api.snov.io/v2"
 
 TARGET_TITLES: list[str] = [
     "office manager",
@@ -47,56 +46,30 @@ GENERIC_PREFIXES: tuple[str, ...] = (
 
 CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+# Pages to check on each domain
+SCRAPE_PATHS = ["", "/contact", "/about"]
+SCRAPE_TIMEOUT = 10  # seconds per request
+
 
 class SnovClient:
-    """Thin wrapper around the Snov.io REST API (v2)."""
+    """Scrapes practice websites to find contact email addresses."""
 
     def __init__(self, client_id: str = "", client_secret: str = ""):
+        # Signature preserved for drop-in compatibility; credentials unused.
         self.client_id = client_id or config.SNOV_CLIENT_ID
         self.client_secret = client_secret or config.SNOV_CLIENT_SECRET
-        self._access_token: str = ""
 
     # ------------------------------------------------------------------
-    # Auth
-    # ------------------------------------------------------------------
-
-    def _get_access_token(self) -> str:
-        """Fetch a fresh OAuth2 access token from Snov.io."""
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-        }
-        try:
-            resp = requests.post(SNOV_AUTH_URL, data=payload, timeout=15)
-            resp.raise_for_status()
-            token = resp.json().get("access_token", "")
-            if not token:
-                logger.error("Snov.io auth returned no access_token")
-            return token
-        except requests.RequestException as exc:
-            logger.error("Snov.io auth request failed: %s", exc)
-            return ""
-
-    def _token(self) -> str:
-        if not self._access_token:
-            self._access_token = self._get_access_token()
-        return self._access_token
-
-    def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._token()}"}
-
-    # ------------------------------------------------------------------
-    # Domain search (v2 two-step async)
+    # Domain search (web scraping)
     # ------------------------------------------------------------------
 
     def find_emails_for_domain(self, domain: str) -> list[dict]:
         """
-        Search Snov.io for emails associated with `domain`.
+        Scrape the practice website for email addresses.
 
-        Step 1 — POST to start the search → get task_hash
-        Step 2 — GET result by task_hash (polls up to 3×)
-
+        Checks the homepage, /contact, and /about pages.
         Returns list of {email, first_name, last_name, full_name, title, confidence}.
         Returns [] on any error or no results.
         """
@@ -104,65 +77,29 @@ class SnovClient:
         if not domain:
             return []
 
-        if not self._token():
-            return []
+        found_emails: set[str] = set()
 
-        # Step 1: start search
-        try:
-            resp = requests.post(
-                f"{SNOV_V2_BASE}/domain-search/domain-emails/start",
-                json={"domain": domain},
-                headers=self._headers(),
-                timeout=20,
-            )
-            resp.raise_for_status()
-            start_data = resp.json()
-        except requests.RequestException as exc:
-            logger.warning("Snov.io domain search failed for %s: %s", domain, exc)
-            return []
+        for path in SCRAPE_PATHS:
+            url = f"https://{domain}{path}"
+            emails = _scrape_emails_from_url(url)
+            found_emails.update(emails)
+            # Fall back to http on the homepage if https returned nothing
+            if not emails and path == "":
+                found_emails.update(_scrape_emails_from_url(f"http://{domain}"))
 
-        task_hash = start_data.get("meta", {}).get("task_hash", "")
-        if not task_hash:
-            logger.warning("Snov.io returned no task_hash for %s", domain)
-            return []
+        contacts = [
+            {
+                "email": email,
+                "first_name": "",
+                "last_name": "",
+                "full_name": "",
+                "title": "",
+                "confidence": "medium",
+            }
+            for email in sorted(found_emails)
+        ]
 
-        # Step 2: fetch result (poll up to 3 times with backoff)
-        result_url = f"{SNOV_V2_BASE}/domain-search/domain-emails/result/{task_hash}"
-        emails_raw: list[dict] = []
-        for attempt in range(3):
-            try:
-                resp = requests.get(result_url, headers=self._headers(), timeout=20)
-                resp.raise_for_status()
-                result = resp.json()
-            except requests.RequestException as exc:
-                logger.warning("Snov.io result fetch failed for %s: %s", domain, exc)
-                return []
-
-            emails_raw = result.get("data", [])
-            if emails_raw:
-                break
-            if attempt < 2:
-                time.sleep(2)
-
-        contacts = []
-        for entry in emails_raw:
-            email = entry.get("email", "")
-            if not email:
-                continue
-            first = entry.get("firstName", entry.get("first_name", ""))
-            last = entry.get("lastName", entry.get("last_name", ""))
-            job = entry.get("currentJob") or []
-            title = job[0].get("title", "") if job else ""
-            contacts.append({
-                "email": email.lower().strip(),
-                "first_name": first,
-                "last_name": last,
-                "full_name": f"{first} {last}".strip(),
-                "title": title,
-                "confidence": entry.get("confidence", ""),
-            })
-
-        logger.info("Snov.io found %d emails for domain %s", len(contacts), domain)
+        logger.info("Scraped %d emails from %s", len(contacts), domain)
         return contacts
 
     # ------------------------------------------------------------------
@@ -177,9 +114,7 @@ class SnovClient:
         1. Target-title match (office manager, billing, etc.) — highest confidence first
         2. Personal email (non-generic prefix) — highest confidence first
         3. Generic inbox (info@, scheduling@, etc.) — highest confidence first
-        4. None if everything is low-confidence and generic
-
-        Low-confidence emails are only used when nothing better exists.
+        4. None if no emails found
         """
         contacts = self.find_emails_for_domain(domain)
         if not contacts:
@@ -213,6 +148,44 @@ class SnovClient:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _scrape_emails_from_url(url: str) -> set[str]:
+    """Fetch a URL and extract all email addresses from it."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=SCRAPE_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.debug("Could not fetch %s: %s", url, exc)
+        return set()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    emails: set[str] = set()
+
+    # mailto: links
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if href.lower().startswith("mailto:"):
+            addr = href[7:].split("?")[0].strip().lower()
+            if EMAIL_REGEX.fullmatch(addr):
+                emails.add(addr)
+
+    # Plain-text regex scan
+    for match in EMAIL_REGEX.finditer(soup.get_text(" ")):
+        emails.add(match.group().lower())
+
+    # Strip obvious false positives (file-extension lookalikes)
+    emails = {
+        e for e in emails
+        if not any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg"))
+    }
+
+    return emails
+
 
 def _normalize_domain(website: str) -> str:
     if not website:

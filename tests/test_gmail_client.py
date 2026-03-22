@@ -1,12 +1,17 @@
-"""Tests for src/gmail_client.py"""
+"""Tests for src/gmail_client.py (Brevo SMTP implementation)."""
 
 import base64
+import smtplib
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.gmail_client import GmailClient, _build_message
 
+
+# ---------------------------------------------------------------------------
+# _build_message helper (kept for compatibility)
+# ---------------------------------------------------------------------------
 
 class TestBuildMessage:
     def test_returns_base64url_encoded_string(self):
@@ -21,7 +26,6 @@ class TestBuildMessage:
         assert "Subject: Test Subject" in decoded
         assert "To: office@clinic.com" in decoded
         # The MIME body itself may be base64-encoded (utf-8 content transfer encoding).
-        # Verify either the plain text is present, or its base64 encoding is.
         body_b64 = base64.b64encode(b"Hello there.").decode()
         assert "Hello there." in decoded or body_b64 in decoded
 
@@ -36,12 +40,14 @@ class TestBuildMessage:
         assert b"sanjana@emberluna.co" in decoded
 
 
+# ---------------------------------------------------------------------------
+# Dry-run behaviour
+# ---------------------------------------------------------------------------
+
 class TestGmailClientDryRun:
     def test_dry_run_send_returns_true(self):
         with patch("config.DRY_RUN", True):
-            client = GmailClient.__new__(GmailClient)
-            client._creds = None
-            client._service = None
+            client = GmailClient()
             result = client.send_email(
                 to="test@clinic.com",
                 subject="Hello",
@@ -49,90 +55,87 @@ class TestGmailClientDryRun:
             )
             assert result is True
 
-    def test_dry_run_does_not_call_gmail_api(self):
-        with patch("config.DRY_RUN", True):
-            client = GmailClient.__new__(GmailClient)
-            client._creds = None
-            client._service = MagicMock()
-
+    def test_dry_run_does_not_open_smtp(self):
+        with patch("config.DRY_RUN", True), \
+             patch("smtplib.SMTP") as mock_smtp:
+            client = GmailClient()
             client.send_email(to="test@clinic.com", subject="S", body="B")
-            # Service should never be called in dry-run
-            client._service.users.assert_not_called()
+            mock_smtp.assert_not_called()
 
+
+# ---------------------------------------------------------------------------
+# SMTP send behaviour
+# ---------------------------------------------------------------------------
 
 class TestGmailClientSend:
-    def _make_client(self):
-        client = GmailClient.__new__(GmailClient)
-        client._creds = MagicMock()
-        client._creds.expired = False
-        client._service = None
-        return client
+    _env = {"BREVO_SMTP_LOGIN": "user@example.com", "BREVO_API_KEY": "key123"}
 
-    @patch("src.gmail_client.build")
-    def test_send_email_success(self, mock_build):
-        with patch("config.DRY_RUN", False):
-            mock_service = MagicMock()
-            mock_build.return_value = mock_service
-            mock_service.users().messages().send().execute.return_value = {"id": "abc"}
+    def test_send_email_success(self):
+        with patch("config.DRY_RUN", False), \
+             patch.dict("os.environ", self._env), \
+             patch("smtplib.SMTP") as mock_smtp_cls:
+            mock_smtp = MagicMock()
+            mock_smtp_cls.return_value.__enter__ = MagicMock(return_value=mock_smtp)
+            mock_smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
 
-            client = self._make_client()
+            client = GmailClient()
             result = client.send_email(to="test@clinic.com", subject="Hi", body="Body")
             assert result is True
 
-    @patch("src.gmail_client.build")
-    def test_send_email_retries_once_on_failure(self, mock_build):
-        from googleapiclient.errors import HttpError
-        with patch("config.DRY_RUN", False):
-            mock_service = MagicMock()
-            mock_build.return_value = mock_service
+    def test_send_email_retries_once_on_failure(self):
+        with patch("config.DRY_RUN", False), \
+             patch.dict("os.environ", self._env), \
+             patch("smtplib.SMTP") as mock_smtp_cls, \
+             patch("time.sleep"):
+            # First context manager raises, second succeeds
+            ctx1 = MagicMock()
+            ctx1.__enter__ = MagicMock(side_effect=smtplib.SMTPException("fail"))
+            ctx1.__exit__ = MagicMock(return_value=False)
 
-            # First call fails, second succeeds
-            mock_service.users().messages().send().execute.side_effect = [
-                HttpError(resp=MagicMock(status=500), content=b"error"),
-                {"id": "abc"},
-            ]
+            ctx2 = MagicMock()
+            ctx2.__enter__ = MagicMock(return_value=MagicMock())
+            ctx2.__exit__ = MagicMock(return_value=False)
 
-            client = self._make_client()
-            with patch("time.sleep"):  # don't actually sleep in tests
-                result = client.send_email(to="test@clinic.com", subject="Hi", body="Body")
+            mock_smtp_cls.side_effect = [ctx1, ctx2]
+
+            client = GmailClient()
+            result = client.send_email(to="test@clinic.com", subject="Hi", body="Body")
             assert result is True
 
-    @patch("src.gmail_client.build")
-    def test_send_email_returns_false_after_two_failures(self, mock_build):
-        from googleapiclient.errors import HttpError
-        with patch("config.DRY_RUN", False):
-            mock_service = MagicMock()
-            mock_build.return_value = mock_service
-            mock_service.users().messages().send().execute.side_effect = HttpError(
-                resp=MagicMock(status=500), content=b"error"
-            )
+    def test_send_email_returns_false_after_two_failures(self):
+        with patch("config.DRY_RUN", False), \
+             patch.dict("os.environ", self._env), \
+             patch("smtplib.SMTP") as mock_smtp_cls, \
+             patch("time.sleep"):
+            ctx = MagicMock()
+            ctx.__enter__ = MagicMock(side_effect=smtplib.SMTPException("fail"))
+            ctx.__exit__ = MagicMock(return_value=False)
+            mock_smtp_cls.return_value = ctx
 
-            client = self._make_client()
-            with patch("time.sleep"):
-                result = client.send_email(to="test@clinic.com", subject="Hi", body="Body", retry=True)
+            client = GmailClient()
+            result = client.send_email(
+                to="test@clinic.com", subject="Hi", body="Body", retry=True
+            )
             assert result is False
 
-    @patch("src.gmail_client.build")
-    def test_check_for_replies_returns_list(self, mock_build):
-        with patch("config.DRY_RUN", False):
-            mock_service = MagicMock()
-            mock_build.return_value = mock_service
+    def test_returns_false_when_credentials_missing(self):
+        with patch("config.DRY_RUN", False), \
+             patch.dict("os.environ", {}, clear=True):
+            client = GmailClient()
+            result = client.send_email(to="test@clinic.com", subject="Hi", body="Body")
+            assert result is False
 
-            mock_service.users().messages().list().execute.return_value = {
-                "messages": [{"id": "msg1"}]
-            }
-            mock_service.users().messages().get().execute.return_value = {
-                "threadId": "thread1",
-                "payload": {
-                    "headers": [
-                        {"name": "From", "value": "doctor@clinic.com"},
-                        {"name": "Subject", "value": "Re: research"},
-                        {"name": "Date", "value": "Mon, 1 Jan 2024"},
-                    ]
-                },
-            }
 
-            client = self._make_client()
-            replies = client.check_for_replies(since_date="2024-01-01")
-            assert len(replies) == 1
-            assert replies[0]["from"] == "doctor@clinic.com"
+# ---------------------------------------------------------------------------
+# check_for_replies — always returns [] with SMTP sender
+# ---------------------------------------------------------------------------
+
+class TestCheckForReplies:
+    def test_returns_empty_list(self):
+        client = GmailClient()
+        replies = client.check_for_replies(since_date="2024-01-01")
+        assert replies == []
+
+    def test_returns_empty_list_without_date(self):
+        client = GmailClient()
+        assert client.check_for_replies() == []
