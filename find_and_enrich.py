@@ -57,7 +57,7 @@ MAX_PRACTICES: int = int(os.getenv("MAX_PRACTICES", "300"))
 
 SPECIALTIES = ["endocrinologist", "orthopedic surgeon"]
 
-VALIDATION_MODEL = "claude-haiku-4-5-20251001"
+VALIDATION_MODEL = "claude-sonnet-4-6"
 
 CALL_LIST_CSV = "call_list.csv"
 BREVO_CSV = "brevo_added.csv"
@@ -70,6 +70,12 @@ BREVO_HEADERS = [
 ]
 
 SCRAPE_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
+SCRAPE_PATHS_EXTRA = ["/staff", "/team", "/our-team", "/physicians"]
+
+# Patterns for obfuscated emails
+_OBFUSCATED_AT = re.compile(r"[a-zA-Z0-9._%+\-]+\s*(?:\[at\]| at |&#64;|%40)\s*[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
+_DATA_EMAIL = re.compile(r'data-email=["\']([^"\']+)["\']', re.IGNORECASE)
+_SCHEMA_EMAIL = re.compile(r'"email"\s*:\s*"([^"]+)"', re.IGNORECASE)
 SCRAPE_TIMEOUT = 6
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -122,11 +128,81 @@ def register(
 # Step 3 — Email scraping
 # ---------------------------------------------------------------------------
 
+def _extract_emails_from_response(resp: requests.Response) -> set[str]:
+    """
+    Extract all candidate emails from a single HTTP response using multiple strategies:
+    - mailto: href links
+    - plain-text regex
+    - JSON-LD structured data (<script type="application/ld+json">)
+    - schema.org "email" fields in raw HTML
+    - obfuscated patterns: [at], " at ", &#64;, %40, data-email attributes
+    """
+    raw = resp.text
+    soup = BeautifulSoup(raw, "html.parser")
+    found: set[str] = set()
+
+    # 1. mailto: links
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if href.lower().startswith("mailto:"):
+            addr = href[7:].split("?")[0].strip().lower()
+            if EMAIL_RE.fullmatch(addr):
+                found.add(addr)
+
+    # 2. Plain-text regex scan
+    for m in EMAIL_RE.finditer(soup.get_text(" ")):
+        found.add(m.group().lower())
+
+    # 3. JSON-LD structured data
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+            # Walk the JSON looking for "email" keys
+            stack = [data] if isinstance(data, dict) else data if isinstance(data, list) else []
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if k.lower() == "email" and isinstance(v, str) and EMAIL_RE.fullmatch(v.strip()):
+                            found.add(v.strip().lower())
+                        elif isinstance(v, (dict, list)):
+                            stack.append(v)
+                elif isinstance(node, list):
+                    stack.extend(node)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 4. schema.org "email" fields in raw HTML
+    for m in _SCHEMA_EMAIL.finditer(raw):
+        val = m.group(1).strip().lower()
+        if EMAIL_RE.fullmatch(val):
+            found.add(val)
+
+    # 5. data-email attributes
+    for m in _DATA_EMAIL.finditer(raw):
+        val = m.group(1).strip().lower()
+        if EMAIL_RE.fullmatch(val):
+            found.add(val)
+
+    # 6. Obfuscated patterns ([at], " at ", &#64;, %40)
+    for m in _OBFUSCATED_AT.finditer(raw):
+        normalised = (
+            m.group()
+            .replace("[at]", "@").replace(" at ", "@").replace("&#64;", "@")
+            .replace("%40", "@").replace(" ", "")
+        )
+        if EMAIL_RE.fullmatch(normalised):
+            found.add(normalised.lower())
+
+    return found
+
+
 def scrape_all_emails(website: str) -> list[str]:
     """
-    Fetch homepage, /contact, /contact-us, /about, /about-us and collect
-    ALL email addresses (mailto: links + regex on page text).
-    Returns sorted, deduplicated list. Skips pages that error or time out.
+    Fetch standard paths plus extra staff/team pages and extract emails
+    using multiple strategies (mailto, regex, JSON-LD, schema.org,
+    obfuscation patterns). Falls back to extra paths if no email found
+    on primary paths. Returns sorted, deduplicated list.
     """
     if not website:
         return []
@@ -137,40 +213,34 @@ def scrape_all_emails(website: str) -> list[str]:
     base = f"{parsed.scheme}://{parsed.netloc}"
 
     found: set[str] = set()
-    for path in SCRAPE_PATHS:
-        url = base + path
-        try:
-            resp = requests.get(
-                url,
-                timeout=SCRAPE_TIMEOUT,
-                headers=BROWSER_HEADERS,
-                allow_redirects=True,
-            )
-            resp.raise_for_status()
-        except Exception as exc:
-            log.debug("    scrape %s → FAILED: %s", url, exc)
-            continue
 
-        log.debug("    scrape %s → %d bytes, status %d", url, len(resp.content), resp.status_code)
-        soup = BeautifulSoup(resp.text, "html.parser")
+    def _fetch_and_extract(paths: list[str]) -> None:
+        for path in paths:
+            url = base + path
+            try:
+                resp = requests.get(
+                    url,
+                    timeout=SCRAPE_TIMEOUT,
+                    headers=BROWSER_HEADERS,
+                    allow_redirects=True,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                log.debug("    scrape %s → FAILED: %s", url, exc)
+                continue
 
-        page_emails: set[str] = set()
+            log.debug("    scrape %s → %d bytes, status %d", url, len(resp.content), resp.status_code)
+            page_emails = _extract_emails_from_response(resp)
+            if page_emails:
+                log.debug("      raw emails on page: %s", sorted(page_emails))
+            found.update(page_emails)
 
-        # mailto: links are most reliable
-        for tag in soup.find_all("a", href=True):
-            href = tag["href"]
-            if href.lower().startswith("mailto:"):
-                addr = href[7:].split("?")[0].strip().lower()
-                if EMAIL_RE.fullmatch(addr):
-                    page_emails.add(addr)
+    _fetch_and_extract(SCRAPE_PATHS)
 
-        # Plain-text regex scan
-        for m in EMAIL_RE.finditer(soup.get_text(" ")):
-            page_emails.add(m.group().lower())
-
-        if page_emails:
-            log.debug("      raw emails on page: %s", sorted(page_emails))
-        found.update(page_emails)
+    # If primary paths yielded nothing, try staff/team pages
+    if not found:
+        log.debug("    no emails from primary paths, trying staff/team pages…")
+        _fetch_and_extract(SCRAPE_PATHS_EXTRA)
 
     # Drop file-extension false positives
     before_filter = set(found)
@@ -380,6 +450,8 @@ def run() -> None:
         log.info("  + %s (%s, %s) — total: %d", p.get("name"), p.get("specialty"), p.get("city"), len(all_practices))
 
     log.info("Claude found %d unique practices", len(all_practices))
+    log.info("Waiting 180s for token bucket to refill before validation…")
+    time.sleep(180)
 
     # -------------------------------------------------------------------
     # STEP 2 — Serper fills gaps
