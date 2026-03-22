@@ -32,13 +32,14 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from claude_finder import find_practices
+from claude_finder import find_all_practices
 from serper_enricher import enrich_practice
 
 load_dotenv()
 
+_log_level = logging.DEBUG if os.getenv("DEBUG_SCRAPE", "").lower() in ("1", "true") else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -137,18 +138,23 @@ def scrape_all_emails(website: str) -> list[str]:
 
     found: set[str] = set()
     for path in SCRAPE_PATHS:
+        url = base + path
         try:
             resp = requests.get(
-                base + path,
+                url,
                 timeout=SCRAPE_TIMEOUT,
                 headers=BROWSER_HEADERS,
                 allow_redirects=True,
             )
             resp.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            log.debug("    scrape %s → FAILED: %s", url, exc)
             continue
 
+        log.debug("    scrape %s → %d bytes, status %d", url, len(resp.content), resp.status_code)
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        page_emails: set[str] = set()
 
         # mailto: links are most reliable
         for tag in soup.find_all("a", href=True):
@@ -156,17 +162,25 @@ def scrape_all_emails(website: str) -> list[str]:
             if href.lower().startswith("mailto:"):
                 addr = href[7:].split("?")[0].strip().lower()
                 if EMAIL_RE.fullmatch(addr):
-                    found.add(addr)
+                    page_emails.add(addr)
 
         # Plain-text regex scan
         for m in EMAIL_RE.finditer(soup.get_text(" ")):
-            found.add(m.group().lower())
+            page_emails.add(m.group().lower())
+
+        if page_emails:
+            log.debug("      raw emails on page: %s", sorted(page_emails))
+        found.update(page_emails)
 
     # Drop file-extension false positives
+    before_filter = set(found)
     found = {
         e for e in found
         if not any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg"))
     }
+    rejected = before_filter - found
+    if rejected:
+        log.debug("    rejected (bad extension): %s", sorted(rejected))
     return sorted(found)
 
 
@@ -354,25 +368,16 @@ def run() -> None:
     seen_phones: set[str] = set()
     seen_domains: set[str] = set()
 
-    for specialty in SPECIALTIES:
-        log.info("Querying Claude: %s (all cities)", specialty)
-        results = find_practices(specialty)
-
-        added = 0
-        for p in results:
-            if len(all_practices) >= MAX_PRACTICES:
-                break
-            if is_duplicate(p, seen_phones, seen_domains):
-                log.debug("  skip duplicate: %s", p.get("name"))
-                continue
-            register(p, seen_phones, seen_domains)
-            all_practices.append(p)
-            added += 1
-
-        log.info("  → %d new practices (running total: %d)", added, len(all_practices))
+    for p in find_all_practices(SPECIALTIES):
         if len(all_practices) >= MAX_PRACTICES:
             log.info("MAX_PRACTICES=%d reached, stopping search", MAX_PRACTICES)
             break
+        if is_duplicate(p, seen_phones, seen_domains):
+            log.debug("  skip duplicate: %s", p.get("name"))
+            continue
+        register(p, seen_phones, seen_domains)
+        all_practices.append(p)
+        log.info("  + %s (%s, %s) — total: %d", p.get("name"), p.get("specialty"), p.get("city"), len(all_practices))
 
     log.info("Claude found %d unique practices", len(all_practices))
 
@@ -411,19 +416,20 @@ def run() -> None:
         if website:
             emails = scrape_all_emails(website)
             p["_candidate_emails"] = emails
-            log.debug(
-                "  %s → %d email(s) found",
-                p.get("name"), len(emails),
+            log.info(
+                "  %s → %d email(s) found  [%s]",
+                p.get("name"), len(emails), website,
             )
         else:
+            log.info("  %s → no website, skipping scrape", p.get("name"))
             p["_candidate_emails"] = []
 
     # -------------------------------------------------------------------
     # STEP 4 — Claude validates email + phone (single batch call)
     # -------------------------------------------------------------------
     log.info("\n--- STEP 4: Claude validating contacts ---")
-    log.info("Waiting 60s for token bucket to refill before validation call…")
-    time.sleep(60)
+    log.info("Waiting 90s for token bucket to refill before validation call…")
+    time.sleep(90)
 
     # Separate practices with contact info from those without
     to_validate = [p for p in all_practices if p.get("_candidate_emails") or p.get("phone")]

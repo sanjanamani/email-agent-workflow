@@ -132,3 +132,17 @@ def find_practices(specialty: str) -> list[dict]:
     except anthropic.APIError as exc:
         log.error("Claude API error for %s: %s", specialty, exc)
         return []
+
+
+INTER_SPECIALTY_DELAY = 65  # seconds between specialty calls to refill token bucket
+
+
+def find_all_practices(specialties: list[str]) -> list[dict]:
+    """Call find_practices for each specialty, sleeping between calls."""
+    all_results: list[dict] = []
+    for i, specialty in enumerate(specialties):
+        if i > 0:
+            log.info("Sleeping %ds between specialty calls to refill token bucket…", INTER_SPECIALTY_DELAY)
+            time.sleep(INTER_SPECIALTY_DELAY)
+        all_results.extend(find_practices(specialty))
+    return all_results
