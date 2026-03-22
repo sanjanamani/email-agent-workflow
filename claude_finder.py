@@ -35,7 +35,11 @@ _client: anthropic.Anthropic | None = None
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        # max_retries=0: disable SDK auto-retries on 429 so our logic controls backoff
+        _client = anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            max_retries=0,
+        )
     return _client
 
 
@@ -74,7 +78,7 @@ def _extract_json_array(text: str) -> list[dict]:
         return []
 
 
-RATE_LIMIT_WAIT = 65   # seconds to pause after a 429 (token bucket refills per minute)
+RATE_LIMIT_WAIT = 75   # seconds to pause after a 429 (token bucket refills per minute)
 INTER_CALL_DELAY = 10  # seconds between successful calls
 
 
