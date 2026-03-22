@@ -3,10 +3,10 @@ find_and_enrich.py — Orchestrates practice discovery, email scraping,
 Claude validation, and routing to Brevo or call_list.csv.
 
 Pipeline:
-  1. Claude finds practices via web search (all 12 specialty × city combos)
+  1. Claude finds practices via web search (one call per specialty, all cities)
   2. Serper fills gaps (phone, website, address) where missing
   3. Scrape each practice website for candidate email addresses
-  4. Claude validates emails and flags fax numbers
+  4. Claude validates emails and flags fax numbers (single batch call)
   5. Route: email found → Brevo | no valid email → call_list.csv
   6. Save brevo_added.csv + call_list.csv, print summary
 
@@ -171,7 +171,7 @@ def scrape_all_emails(website: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Claude validates email + phone
+# Step 4 — Claude validates email + phone (single batch call)
 # ---------------------------------------------------------------------------
 
 _validation_client: anthropic.Anthropic | None = None
@@ -184,69 +184,6 @@ def _get_validation_client() -> anthropic.Anthropic:
     return _validation_client
 
 
-def validate_contact(practice: dict, candidate_emails: list[str]) -> dict:
-    """
-    Ask Claude (no web search) to:
-      1. Pick the best email for a practice manager / billing coordinator.
-         Reject: noreply, no-reply, info@, admin@, support@, webmaster@,
-         privacy@, press@, media@, patient-portal-style addresses.
-      2. Flag whether the phone number looks like a fax line.
-
-    Returns:
-      {best_email: str|None, email_confidence: "high"|"medium"|"low",
-       phone_is_fax: bool, reason: str}
-    """
-    prompt = f"""You are validating contact info for a medical practice.
-
-Practice: {practice['name']} ({practice.get('specialty', '')}, {practice.get('city', '')} TX)
-Website: {practice.get('website', '')}
-Phone found: {practice.get('phone', '')}
-Candidate emails found on website: {candidate_emails}
-
-Tasks:
-1. Pick the best email for reaching a practice manager or billing
-   coordinator. Reject: noreply, no-reply, info@, admin@, support@,
-   webmaster@, privacy@, press@, media@, anything that looks like
-   a patient portal login or generic department inbox.
-   Pick a direct staff email if available.
-2. Flag if the phone number looks like a fax (fax numbers are often
-   listed near 'fax:' text — if you see evidence it's a fax, mark it)
-
-Return ONLY this JSON:
-{{
-  "best_email": "chosen@email.com or null",
-  "email_confidence": "high/medium/low",
-  "phone_is_fax": true/false,
-  "reason": "one sentence explanation"
-}}"""
-
-    try:
-        client = _get_validation_client()
-        response = client.messages.create(
-            model=VALIDATION_MODEL,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(b.text for b in response.content if b.type == "text")
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return _null_validation("could not parse validation response")
-
-        result = json.loads(match.group())
-
-        # Normalise JSON null / string "null" → Python None
-        if isinstance(result.get("best_email"), str) and result["best_email"].lower() in (
-            "null", "none", ""
-        ):
-            result["best_email"] = None
-
-        return result
-
-    except (anthropic.APIError, json.JSONDecodeError) as exc:
-        log.error("Validation error for %r: %s", practice.get("name"), exc)
-        return _null_validation(str(exc))
-
-
 def _null_validation(reason: str) -> dict:
     return {
         "best_email": None,
@@ -254,6 +191,82 @@ def _null_validation(reason: str) -> dict:
         "phone_is_fax": False,
         "reason": reason,
     }
+
+
+def validate_contacts_batch(practices: list[dict]) -> list[dict]:
+    """
+    Send all practices to Claude in one call. Returns a list of validation
+    dicts (same order as input):
+      {best_email, email_confidence, phone_is_fax, reason}
+    Falls back to _null_validation for any practice that can't be parsed.
+    """
+    if not practices:
+        return []
+
+    entries = [
+        {
+            "index": i,
+            "name": p.get("name", ""),
+            "specialty": p.get("specialty", ""),
+            "city": p.get("city", ""),
+            "website": p.get("website", ""),
+            "phone": p.get("phone", ""),
+            "candidate_emails": p.get("_candidate_emails", []),
+        }
+        for i, p in enumerate(practices)
+    ]
+
+    prompt = (
+        "Validate the following contact list for a medical outreach campaign.\n"
+        "For each entry, pick the best email if multiple exist, flag if the phone "
+        "looks like a fax, and rate confidence high/medium/low.\n\n"
+        "Rules for best_email: reject noreply, no-reply, info@, admin@, support@, "
+        "webmaster@, privacy@, press@, media@, patient-portal addresses. "
+        "Prefer a direct staff or billing email. Set to null if none qualify.\n\n"
+        f"Practices:\n{json.dumps(entries, indent=2)}\n\n"
+        "Return ONLY a JSON array in the SAME ORDER (one object per practice) with fields:\n"
+        '  "best_email": "email or null",\n'
+        '  "email_confidence": "high/medium/low",\n'
+        '  "phone_is_fax": true/false,\n'
+        '  "reason": "one sentence"\n'
+    )
+
+    try:
+        client = _get_validation_client()
+        response = client.messages.create(
+            model=VALIDATION_MODEL,
+            max_tokens=150 * len(practices),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in response.content if b.type == "text")
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            log.error("Batch validation: could not find JSON array in response")
+            return [_null_validation("could not parse batch response")] * len(practices)
+
+        results = json.loads(match.group())
+
+        # Normalise and pad to match input length
+        validated = []
+        for i, p in enumerate(practices):
+            r = results[i] if i < len(results) else {}
+            if not isinstance(r, dict):
+                r = {}
+            # Normalise JSON null / string "null" → Python None
+            email = r.get("best_email")
+            if isinstance(email, str) and email.lower() in ("null", "none", ""):
+                email = None
+            validated.append({
+                "best_email": email,
+                "email_confidence": r.get("email_confidence", "low"),
+                "phone_is_fax": bool(r.get("phone_is_fax", False)),
+                "reason": r.get("reason", ""),
+            })
+        return validated
+
+    except (anthropic.APIError, json.JSONDecodeError) as exc:
+        log.error("Batch validation error: %s", exc)
+        return [_null_validation(str(exc))] * len(practices)
 
 
 # ---------------------------------------------------------------------------
@@ -406,24 +419,26 @@ def run() -> None:
             p["_candidate_emails"] = []
 
     # -------------------------------------------------------------------
-    # STEP 4 — Claude validates email + phone
+    # STEP 4 — Claude validates email + phone (single batch call)
     # -------------------------------------------------------------------
     log.info("\n--- STEP 4: Claude validating contacts ---")
+    log.info("Waiting 60s for token bucket to refill before validation call…")
+    time.sleep(60)
 
-    for p in all_practices:
-        emails = p.get("_candidate_emails", [])
-        phone = p.get("phone", "")
+    # Separate practices with contact info from those without
+    to_validate = [p for p in all_practices if p.get("_candidate_emails") or p.get("phone")]
+    no_info = [p for p in all_practices if not p.get("_candidate_emails") and not p.get("phone")]
 
-        if not emails and not phone:
-            p["_validation"] = _null_validation("no contact info found")
-            continue
+    for p in no_info:
+        p["_validation"] = _null_validation("no contact info found")
 
-        p["_validation"] = validate_contact(p, emails)
-
-        # Clear phone immediately if Claude flagged it as a fax line
-        if p["_validation"].get("phone_is_fax"):
-            log.debug("  %s: phone flagged as fax, clearing", p.get("name"))
-            p["phone"] = ""
+    if to_validate:
+        validations = validate_contacts_batch(to_validate)
+        for p, v in zip(to_validate, validations):
+            p["_validation"] = v
+            if v.get("phone_is_fax"):
+                log.debug("  %s: phone flagged as fax, clearing", p.get("name"))
+                p["phone"] = ""
 
     # -------------------------------------------------------------------
     # STEP 5 — Route to Brevo or call list
