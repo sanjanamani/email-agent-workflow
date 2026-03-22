@@ -1,9 +1,10 @@
 """
-claude_finder.py — Uses Claude with web search to find real, currently
-operating independent specialty clinics in DFW.
+claude_finder.py — Uses Claude to find real, currently operating
+independent specialty clinics in DFW from training knowledge.
 
-The web_search tool is server-side: Anthropic executes searches automatically.
-We loop to handle pause_turn (server-side iteration limit) until end_turn.
+Makes ONE API call per specialty covering all cities at once.
+No web search tool — Claude reasons from training data only.
+Serper handles any follow-up discovery/enrichment.
 """
 
 import json
@@ -11,6 +12,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 import anthropic
 from dotenv import load_dotenv
@@ -19,13 +21,13 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-haiku-4-5-20251001"
-MAX_CONTINUATIONS = 5  # guard against runaway pause_turn loops
+MODEL = "claude-sonnet-4-6"
+
+CITIES = ["Dallas", "Plano", "Frisco", "Allen", "McKinney", "Richardson"]
 
 SYSTEM_PROMPT = (
-    "You are a medical practice researcher finding real, currently "
+    "You are a medical practice researcher with knowledge of real, currently "
     "operating independent specialty clinics in the Dallas-Fort Worth area. "
-    "You have access to web search — use it to verify practices are real. "
     "Return ONLY valid JSON, no explanation, no markdown."
 )
 
@@ -35,30 +37,36 @@ _client: anthropic.Anthropic | None = None
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        # max_retries=0: disable SDK auto-retries on 429 so our logic controls backoff
+        _client = anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            max_retries=0,
+        )
     return _client
 
 
-def _user_prompt(specialty: str, city: str) -> str:
+def _user_prompt(specialty: str) -> str:
+    cities_str = ", ".join(CITIES)
     return (
-        f"Search for independent {specialty} clinics in {city}, Texas. "
-        "Use web search to verify they exist and are currently operating.\n\n"
+        f"List independent {specialty} clinics across these DFW cities: "
+        f"{cities_str}, TX. "
+        "Use your training knowledge to identify real practices.\n\n"
         "Exclude: hospitals, Baylor, UT Southwestern, Methodist, Parkland, "
         "Children's Medical, any group with 10+ locations, urgent care, "
         "walk-in clinics.\n\n"
-        "Return ONLY this JSON array:\n"
+        "Return ONLY this JSON array (up to 15 practices total across all cities, "
+        "no duplicates):\n"
         "[\n"
         "  {\n"
         '    "name": "practice name",\n'
         '    "website": "https://... or empty string",\n'
         '    "phone": "(xxx) xxx-xxxx or empty string",\n'
         '    "address": "full address or empty string",\n'
-        f'    "city": "{city}",\n'
+        '    "city": "one of the cities listed above",\n'
         f'    "specialty": "{specialty}"\n'
         "  }\n"
         "]\n"
-        "Return max 10 practices. Only include ones you are confident are real "
-        "independent practices currently operating."
+        "Only include practices you are confident are real and currently operating."
     )
 
 
@@ -74,63 +82,87 @@ def _extract_json_array(text: str) -> list[dict]:
         return []
 
 
-def find_practices(specialty: str, city: str) -> list[dict]:
+def _retry_after(exc: anthropic.RateLimitError, buffer: int = 10) -> int:
     """
-    Use Claude + web search to find real independent specialty clinics in city.
+    Read retry-after seconds from the exception's response headers.
+    Falls back to 60s if the header is absent or unparseable.
+    """
+    fallback = 60
+    try:
+        headers = exc.response.headers  # type: ignore[attr-defined]
+        val = headers.get("retry-after", "")
+        if val:
+            return int(val) + buffer
+        reset = headers.get("anthropic-ratelimit-input-tokens-reset", "")
+        if reset:
+            reset_dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+            secs = int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + buffer
+            return max(secs, buffer)
+    except Exception:
+        pass
+    return fallback
 
-    Returns a list of dicts:
-      {name, website, phone, address, city, specialty}
 
+def find_practices(specialty: str) -> list[dict]:
+    """
+    Use Claude (training knowledge only, no web search) to list real
+    independent specialty clinics across all DFW cities.
+
+    Returns a list of dicts: {name, website, phone, address, city, specialty}
     Returns [] on any error or empty result.
-    1-second delay on exit (rate limiting).
     """
     client = _get_client()
-    user_content = _user_prompt(specialty, city)
-    messages: list[dict] = [{"role": "user", "content": user_content}]
-    response = None
+    user_content = _user_prompt(specialty)
 
     try:
-        for _ in range(MAX_CONTINUATIONS):
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            )
-
-            if response.stop_reason == "end_turn":
-                break
-            elif response.stop_reason == "pause_turn":
-                # Server-side tool hit iteration limit; re-send to let it continue.
-                # Do NOT add a new user message — the API detects the trailing
-                # server_tool_use block and resumes automatically.
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": response.content},
-                ]
-            else:
-                # Unexpected stop reason; use whatever we have
-                break
-
-        if response is None:
-            return []
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
 
         text = "".join(
             block.text for block in response.content if block.type == "text"
         )
         if not text:
-            log.warning("No text in Claude response for %s / %s", specialty, city)
+            log.warning("No text in Claude response for %s", specialty)
             return []
 
         practices = _extract_json_array(text)
-        log.info(
-            "Claude found %d practices for %s / %s", len(practices), specialty, city
-        )
+        log.info("Claude found %d practices for %s", len(practices), specialty)
         return practices
 
+    except anthropic.RateLimitError as exc:
+        wait = _retry_after(exc)
+        log.warning("Rate limited for %s. Waiting %ds (from retry-after header)…", specialty, wait)
+        time.sleep(wait)
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            text = "".join(b.text for b in response.content if b.type == "text")
+            practices = _extract_json_array(text)
+            log.info("Claude found %d practices for %s (retry)", len(practices), specialty)
+            return practices
+        except anthropic.APIError as retry_exc:
+            log.error("Claude API error for %s on retry: %s", specialty, retry_exc)
+            return []
     except anthropic.APIError as exc:
-        log.error("Claude API error for %s / %s: %s", specialty, city, exc)
+        log.error("Claude API error for %s: %s", specialty, exc)
         return []
-    finally:
-        time.sleep(1)
+
+
+def find_all_practices(specialties: list[str]) -> list[dict]:
+    """Call find_practices for each specialty and combine results."""
+    print(
+        "Note: if you just ran this script, wait 3-4 minutes before running "
+        "again to let the token bucket refill."
+    )
+    all_results: list[dict] = []
+    for specialty in specialties:
+        all_results.extend(find_practices(specialty))
+    return all_results
