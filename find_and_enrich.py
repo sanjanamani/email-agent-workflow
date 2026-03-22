@@ -428,8 +428,6 @@ def run() -> None:
     # STEP 4 — Claude validates email + phone (single batch call)
     # -------------------------------------------------------------------
     log.info("\n--- STEP 4: Claude validating contacts ---")
-    log.info("Waiting 90s for token bucket to refill before validation call…")
-    time.sleep(90)
 
     # Separate practices with contact info from those without
     to_validate = [p for p in all_practices if p.get("_candidate_emails") or p.get("phone")]
