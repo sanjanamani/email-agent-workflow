@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Inara — Outreach Tracker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--color-background-primary:#fff;--color-background-secondary:#f5f4f0;--color-text-primary:#1a1a18;--color-text-secondary:#5f5e5a;--color-text-tertiary:#888780;--color-border-tertiary:rgba(0,0,0,0.12);--color-border-secondary:rgba(0,0,0,0.22);--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--border-radius-md:8px;--border-radius-lg:12px}
+@media(prefers-color-scheme:dark){:root{--color-background-primary:#1e1e1c;--color-background-secondary:#2a2a28;--color-text-primary:#f0ede8;--color-text-secondary:#b4b2a9;--color-text-tertiary:#888780;--color-border-tertiary:rgba(255,255,255,0.1);--color-border-secondary:rgba(255,255,255,0.2)}}
+body{font-family:var(--font-sans);background:var(--color-background-secondary);color:var(--color-text-primary);min-height:100vh;padding:2rem 1rem}
+.app{max-width:720px;margin:0 auto}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:12px}
+.topbar h1{font-size:18px;font-weight:500}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.5rem}
+.stat{background:var(--color-background-primary);border-radius:var(--border-radius-md);padding:10px 12px;border:0.5px solid var(--color-border-tertiary)}
+.stat-label{font-size:11px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.stat-val{font-size:22px;font-weight:500}
+.controls{display:flex;gap:8px;margin-bottom:1rem;flex-wrap:wrap}
+.controls input{flex:1;min-width:160px}
+select,input{border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);background:var(--color-background-primary);color:var(--color-text-primary);font-size:13px;font-family:var(--font-sans);height:34px;padding:0 10px;outline:none}
+input:focus,select:focus{border-color:var(--color-text-primary)}
+.btn{height:34px;padding:0 14px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);background:transparent;color:var(--color-text-primary);font-size:13px;font-family:var(--font-sans);cursor:pointer;white-space:nowrap;transition:background .15s}
+.btn:hover{background:var(--color-background-secondary)}
+.btn-primary{background:var(--color-text-primary);color:var(--color-background-primary);border-color:var(--color-text-primary)}
+.btn-primary:hover{opacity:.85}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden;margin-bottom:1rem}
+.practice-row{display:grid;grid-template-columns:10px 1fr auto;gap:12px;align-items:start;padding:12px 14px;border-bottom:0.5px solid var(--color-border-tertiary)}
+.practice-row:last-child{border-bottom:none}
+.status-dot{width:8px;height:8px;border-radius:50%;margin-top:5px}
+.dot-pending{background:#888780}
+.dot-called{background:#EF9F27}
+.dot-brevo{background:#639922}
+.dot-noemail{background:#E24B4A}
+.practice-name{font-size:13px;font-weight:500;margin-bottom:2px}
+.practice-meta{font-size:11px;color:var(--color-text-secondary)}
+.practice-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.btn-sm{height:28px;padding:0 10px;font-size:11px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);background:transparent;color:var(--color-text-primary);cursor:pointer;white-space:nowrap;transition:background .15s}
+.btn-sm:hover{background:var(--color-background-secondary)}
+.btn-sm.green{background:#EAF3DE;color:#3B6D11;border-color:#97C459}
+.email-input-row{display:none;gap:6px;margin-top:8px;align-items:center}
+.email-input-row input{flex:1;height:28px;font-size:12px}
+.toast{font-size:12px;padding:8px 12px;border-radius:var(--border-radius-md);margin-bottom:8px;display:none}
+.toast.ok{background:#EAF3DE;color:#3B6D11;display:block}
+.toast.err{background:#FCEBEB;color:#A32D2D;display:block}
+.apikey-row{display:flex;gap:8px;margin-bottom:1rem;align-items:center}
+.apikey-row input{flex:1}
+.key-status{font-size:12px;color:var(--color-text-tertiary);white-space:nowrap}
+.empty{text-align:center;padding:2rem;color:var(--color-text-tertiary);font-size:13px}
+.filter-tabs{display:flex;gap:4px;margin-bottom:1rem;flex-wrap:wrap}
+.tab{height:28px;padding:0 12px;font-size:12px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);background:transparent;color:var(--color-text-secondary);cursor:pointer;transition:all .15s}
+.tab.active{background:var(--color-text-primary);color:var(--color-background-primary);border-color:var(--color-text-primary)}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <h1>Inara — outreach tracker</h1>
+    <button class="btn btn-primary" onclick="document.getElementById('csvFile').click()">Import call_list.csv</button>
+    <input type="file" id="csvFile" accept=".csv" style="display:none" onchange="handleCSV(event)"/>
+  </div>
+  <div class="apikey-row">
+    <input type="password" id="brevoKey" placeholder="Brevo API key (paste once)" oninput="saveKey()"/>
+    <span class="key-status" id="keyStatus"></span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Total</div><div class="stat-val" id="s-total">0</div></div>
+    <div class="stat"><div class="stat-label">Called</div><div class="stat-val" id="s-called">0</div></div>
+    <div class="stat"><div class="stat-label">In Brevo</div><div class="stat-val" id="s-brevo">0</div></div>
+    <div class="stat"><div class="stat-label">No email</div><div class="stat-val" id="s-noemail">0</div></div>
+  </div>
+  <div class="filter-tabs">
+    <button class="tab active" onclick="setFilter('all',this)">All</button>
+    <button class="tab" onclick="setFilter('pending',this)">To call</button>
+    <button class="tab" onclick="setFilter('called',this)">Called</button>
+    <button class="tab" onclick="setFilter('brevo',this)">In Brevo</button>
+    <button class="tab" onclick="setFilter('noemail',this)">No email</button>
+  </div>
+  <div id="toast" class="toast"></div>
+  <div class="card">
+    <div class="empty" id="emptyMsg">Import your call_list.csv to get started</div>
+    <div id="practiceList"></div>
+  </div>
+  <button class="btn" style="width:100%" onclick="addManual()">+ Add practice manually</button>
+</div>
+<script>
+let practices = JSON.parse(localStorage.getItem('inara_practices') || '[]');
+let filter = 'all';
+function saveKey(){
+  const k = document.getElementById('brevoKey').value.trim();
+  if(k) localStorage.setItem('inara_brevo_key', k);
+  document.getElementById('keyStatus').textContent = k ? '✓ saved' : '';
+}
+window.addEventListener('load', () => {
+  const k = localStorage.getItem('inara_brevo_key');
+  if(k){ document.getElementById('brevoKey').value = k; document.getElementById('keyStatus').textContent = '✓ saved'; }
+  render();
+});
+function handleCSV(e){
+  const file = e.target.files[0]; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const lines = ev.target.result.split('\n').filter(l=>l.trim());
+    const headers = lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/"/g,''));
+    let added = 0, dupes = 0;
+    for(let i=1;i<lines.length;i++){
+      const cols = lines[i].split(',').map(c=>c.trim().replace(/"/g,''));
+      const row = {};
+      headers.forEach((h,j)=>row[h]=cols[j]||'');
+      const name = row['practice name']||row['name']||'Unknown';
+      const phone = row['phone']||'';
+      if(!practices.find(p=>(phone&&p.phone===phone)||p.name===name)){
+        practices.push({id:Date.now()+'_'+i,name,phone,website:row['website']||'',specialty:row['specialty']||'',city:row['city']||'',address:row['address']||'',status:'pending',email:''});
+        added++;
+      } else dupes++;
+    }
+    save(); render();
+    toast(`Imported ${added} practices (${dupes} duplicates skipped)`, true);
+  };
+  reader.readAsText(file);
+  e.target.value='';
+}
+function addManual(){
+  const name = prompt('Practice name:'); if(!name) return;
+  const phone = prompt('Phone (or leave blank):') || '';
+  const city = prompt('City:') || '';
+  const specialty = prompt('Specialty:') || 'Endocrinology';
+  const website = prompt('Website (or leave blank):') || '';
+  practices.push({id:Date.now()+'_m',name,phone,website,specialty,city,address:'',status:'pending',email:''});
+  save(); render();
+}
+function setFilter(f, el){
+  filter = f;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  render();
+}
+function markCalled(id){
+  const p = practices.find(x=>x.id===id);
+  if(p){ p.status = p.status==='called'?'pending':'called'; save(); render(); }
+}
+function toggleEmail(id){
+  const row = document.getElementById('erow-'+id);
+  if(row) row.style.display = row.style.display==='flex'?'none':'flex';
+}
+function markNoEmail(id){
+  const p = practices.find(x=>x.id===id);
+  if(p){ p.status='noemail'; save(); render(); toast(p.name+' marked as no email', true); }
+}
+async function pushBrevo(id){
+  const p = practices.find(x=>x.id===id);
+  const input = document.getElementById('einput-'+id);
+  const email = input?.value.trim()||p.email;
+  if(!email){ toast('Enter an email address first', false); return; }
+  const key = localStorage.getItem('inara_brevo_key');
+  if(!key){ toast('Paste your Brevo API key at the top first', false); return; }
+  const btn = document.getElementById('pbtn-'+id);
+  if(btn){btn.disabled=true;btn.textContent='Adding...';}
+  try{
+    const res = await fetch('https://api.brevo.com/v3/contacts',{
+      method:'POST',
+      headers:{'api-key':key,'Content-Type':'application/json'},
+      body:JSON.stringify({email,listIds:[7],updateEnabled:false,attributes:{FIRSTNAME:'',LASTNAME:p.name,PHONE:p.phone,PRACTICE_NAME:p.name,SPECIALTY:p.specialty,CITY:p.city}})
+    });
+    if(res.status===201||res.status===204){
+      p.email=email;p.status='brevo';save();render();
+      toast(p.name+' added to Brevo — sequence starts automatically', true);
+    } else if(res.status===400){
+      const d=await res.json();
+      if(d.code==='duplicate_parameter'){p.email=email;p.status='brevo';save();render();toast(email+' already in Brevo', true);}
+      else toast('Brevo error: '+(d.message||res.status), false);
+    } else toast('Unexpected response: '+res.status, false);
+  } catch(e){ toast('Network error — check your API key', false); }
+  if(btn){btn.disabled=false;btn.textContent='Push to Brevo';}
+}
+function render(){
+  const filtered = filter==='all'?practices:practices.filter(p=>p.status===filter);
+  document.getElementById('s-total').textContent = practices.length;
+  document.getElementById('s-called').textContent = practices.filter(p=>p.status==='called').length;
+  document.getElementById('s-brevo').textContent = practices.filter(p=>p.status==='brevo').length;
+  document.getElementById('s-noemail').textContent = practices.filter(p=>p.status==='noemail').length;
+  const empty = document.getElementById('emptyMsg');
+  const list = document.getElementById('practiceList');
+  if(practices.length===0){empty.style.display='block';list.innerHTML='';return;}
+  empty.style.display='none';
+  list.innerHTML = filtered.map(p=>{
+    const dot = {pending:'dot-pending',called:'dot-called',brevo:'dot-brevo',noemail:'dot-noemail'}[p.status];
+    const label = {pending:'to call',called:'called — enter email',brevo:'in brevo',noemail:'no email'}[p.status];
+    const meta = [p.specialty,p.city,p.phone].filter(Boolean).join(' · ');
+    const canEmail = p.status==='called'||p.status==='pending';
+    return `<div class="practice-row">
+      <div class="status-dot ${dot}"></div>
+      <div>
+        <div class="practice-name">${p.name}</div>
+        <div class="practice-meta">${meta} · <span style="color:var(--color-text-tertiary)">${label}</span></div>
+        ${p.email&&p.status==='brevo'?`<div class="practice-meta" style="color:#3B6D11;margin-top:2px">${p.email}</div>`:''}
+        ${canEmail?`<div id="erow-${p.id}" class="email-input-row">
+          <input type="email" id="einput-${p.id}" placeholder="billing@practice.com" value="${p.email||''}"/>
+          <button class="btn-sm green" id="pbtn-${p.id}" onclick="pushBrevo('${p.id}')">Push to Brevo</button>
+          <button class="btn-sm" onclick="markNoEmail('${p.id}')">No email</button>
+        </div>`:''}
+      </div>
+      <div class="practice-actions">
+        ${p.status!=='brevo'&&p.status!=='noemail'?`<button class="btn-sm ${p.status==='called'?'green':''}" onclick="markCalled('${p.id}')">${p.status==='called'?'✓ Called':'Mark called'}</button>`:''}
+        ${canEmail?`<button class="btn-sm" onclick="toggleEmail('${p.id}')">Enter email</button>`:''}
+        ${p.website?`<a href="${p.website}" target="_blank"><button class="btn-sm">Website</button></a>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+function save(){ localStorage.setItem('inara_practices', JSON.stringify(practices)); }
+function toast(msg, ok){
+  const t = document.getElementById('toast');
+  t.textContent=msg; t.className='toast '+(ok?'ok':'err');
+  setTimeout(()=>t.className='toast', 3500);
+}
+</script>
+</body>
+</html>

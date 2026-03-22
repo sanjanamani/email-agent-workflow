@@ -53,12 +53,15 @@ def _practice_location(addresses: list[dict]) -> dict | None:
     return None
 
 
-def _parse_result(result: dict, specialty: str) -> dict | None:
+def _parse_result(result: dict, specialty: str, enum_type: str) -> dict | None:
     """
     Convert a single NPI registry result to the pipeline practice dict.
     Returns None if the entry has no practice-location address.
-    Phone comes from the location address; organization name from basic
-    for NPI-2, first+last name for NPI-1.
+
+    NPI-2 (organizations): name from basic.organization_name
+    NPI-1 (individuals):   name from basic.organization_name if present,
+                           otherwise basic.first_name + last_name + "MD"
+    Phone from addresses[address_purpose=LOCATION].telephone_number.
     """
     addresses: list[dict] = result.get("addresses", [])
     loc = _practice_location(addresses)
@@ -67,13 +70,12 @@ def _parse_result(result: dict, specialty: str) -> dict | None:
 
     basic: dict = result.get("basic", {})
 
-    # NPI-2: organization_name present; NPI-1: first_name + last_name
     org_name: str = basic.get("organization_name", "").strip()
     if not org_name:
         first = basic.get("first_name", "").strip()
         last = basic.get("last_name", "").strip()
-        credential = basic.get("credential", "").strip()
-        org_name = " ".join(filter(None, [first, last, credential]))
+        suffix = "MD" if enum_type == "NPI-1" else ""
+        org_name = " ".join(filter(None, [first, last, suffix]))
 
     phone: str = loc.get("telephone_number", "").strip()
     city: str = loc.get("city", "").strip().title()
@@ -122,7 +124,7 @@ def _fetch_one(taxonomy_desc: str, enumeration_type: str, city: str, specialty: 
 
     practices = []
     for result in results:
-        practice = _parse_result(result, specialty)
+        practice = _parse_result(result, specialty, enum_type)
         if practice:
             practices.append(practice)
     return practices

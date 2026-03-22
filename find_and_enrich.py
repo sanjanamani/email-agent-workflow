@@ -1,27 +1,29 @@
 """
 find_and_enrich.py — Orchestrates practice discovery, email scraping,
-Claude validation, and routing to Brevo or call_list.csv.
+Claude validation, and routing to Brevo (single source of truth).
 
 Pipeline:
   1a. NPI Registry finds authoritative practices (no API key needed)
   1b. Claude finds additional practices via training knowledge
-      NPI data is merged first; Claude fills in anything NPI misses.
-  2. Serper fills gaps (phone, website, address) where missing
-  3. Scrape each practice website for candidate email addresses
-  4. Claude validates emails and flags fax numbers (single batch call)
-  5. Route: email found → Brevo | no valid email → call_list.csv
-  6. Save brevo_added.csv + call_list.csv, print summary
+  2.  Serper fills gaps (phone, website, address) where missing
+  3.  Scrape each practice website for candidate email addresses
+  4.  Claude validates emails and flags fax numbers (single batch call)
+  5.  Route every practice to Brevo:
+        email found (high/medium confidence) → BREVO_LIST_ID (list 7)
+        no valid email                        → BREVO_CALL_LIST_ID
+      Before adding, check Brevo by phone — skip if already present.
+  6.  Print summary
 
 ENV VARS:
-  ANTHROPIC_API_KEY   required
-  SERPER_API_KEY      optional (enrichment skipped if absent)
-  BREVO_API_KEY       required unless DRY_RUN=true
-  BREVO_LIST_ID       required unless DRY_RUN=true  (default: 7)
-  DRY_RUN             "true" → print actions, skip API writes, still save CSVs
-  MAX_PRACTICES       cap on total practices (default: 300)
+  ANTHROPIC_API_KEY    required
+  SERPER_API_KEY       optional (enrichment skipped if absent)
+  BREVO_API_KEY        required unless DRY_RUN=true
+  BREVO_LIST_ID        list for email contacts (default: 7)
+  BREVO_CALL_LIST_ID   list for call-needed contacts (no email)
+  DRY_RUN              "true" → print actions, skip API writes
+  MAX_PRACTICES        cap on total practices (default: 300)
 """
 
-import csv
 import json
 import logging
 import os
@@ -37,7 +39,6 @@ from dotenv import load_dotenv
 from claude_finder import find_all_practices, CITIES
 from npi_client import fetch_npi_practices
 from serper_enricher import enrich_practice
-from sheets_client import append_to_sheet
 
 load_dotenv()
 
@@ -56,46 +57,38 @@ log = logging.getLogger(__name__)
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 BREVO_API_KEY: str = os.getenv("BREVO_API_KEY", "")
 BREVO_LIST_ID: int = int(os.getenv("BREVO_LIST_ID", "7"))
+BREVO_CALL_LIST_ID: int = int(os.getenv("BREVO_CALL_LIST_ID", "0"))
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 MAX_PRACTICES: int = int(os.getenv("MAX_PRACTICES", "300"))
 
 SPECIALTIES = ["endocrinologist", "orthopedic surgeon"]
-
 VALIDATION_MODEL = "claude-sonnet-4-6"
-
-CALL_LIST_CSV = "call_list.csv"
-BREVO_CSV = "brevo_added.csv"
-
-CALL_LIST_HEADERS = [
-    "Practice Name", "Phone", "Website", "Specialty", "City", "Address", "Reason",
-]
-BREVO_HEADERS = [
-    "Practice Name", "Email", "Confidence", "City", "Specialty", "Phone", "Website",
-]
 
 SCRAPE_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
 SCRAPE_PATHS_EXTRA = ["/staff", "/team", "/our-team", "/physicians"]
 
 # Patterns for obfuscated emails
-_OBFUSCATED_AT = re.compile(r"[a-zA-Z0-9._%+\-]+\s*(?:\[at\]| at |&#64;|%40)\s*[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
+_OBFUSCATED_AT = re.compile(
+    r"[a-zA-Z0-9._%+\-]+\s*(?:\[at\]| at |&#64;|%40)\s*[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+    re.IGNORECASE,
+)
 _DATA_EMAIL = re.compile(r'data-email=["\']([^"\']+)["\']', re.IGNORECASE)
 _SCHEMA_EMAIL = re.compile(r'"email"\s*:\s*"([^"]+)"', re.IGNORECASE)
 SCRAPE_TIMEOUT = 6
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+BREVO_HEADERS = {"api-key": BREVO_API_KEY, "Content-Type": "application/json"}
 
 # ---------------------------------------------------------------------------
 # Deduplication helpers
 # ---------------------------------------------------------------------------
 
 def normalize_phone(phone: str) -> str:
-    """Strip everything except digits."""
     return re.sub(r"\D", "", phone or "")
 
 
 def extract_domain(website: str) -> str:
-    """Return bare domain (no www, no path) or empty string."""
     if not website:
         return ""
     if not website.startswith("http"):
@@ -107,19 +100,13 @@ def extract_domain(website: str) -> str:
         return ""
 
 
-def is_duplicate(
-    practice: dict, seen_phones: set[str], seen_domains: set[str]
-) -> bool:
+def is_duplicate(practice: dict, seen_phones: set[str], seen_domains: set[str]) -> bool:
     phone = normalize_phone(practice.get("phone", ""))
     domain = extract_domain(practice.get("website", ""))
-    return (bool(phone) and phone in seen_phones) or (
-        bool(domain) and domain in seen_domains
-    )
+    return (bool(phone) and phone in seen_phones) or (bool(domain) and domain in seen_domains)
 
 
-def register(
-    practice: dict, seen_phones: set[str], seen_domains: set[str]
-) -> None:
+def register(practice: dict, seen_phones: set[str], seen_domains: set[str]) -> None:
     phone = normalize_phone(practice.get("phone", ""))
     domain = extract_domain(practice.get("website", ""))
     if phone:
@@ -133,14 +120,6 @@ def register(
 # ---------------------------------------------------------------------------
 
 def _extract_emails_from_response(resp: requests.Response) -> set[str]:
-    """
-    Extract all candidate emails from a single HTTP response using multiple strategies:
-    - mailto: href links
-    - plain-text regex
-    - JSON-LD structured data (<script type="application/ld+json">)
-    - schema.org "email" fields in raw HTML
-    - obfuscated patterns: [at], " at ", &#64;, %40, data-email attributes
-    """
     raw = resp.text
     soup = BeautifulSoup(raw, "html.parser")
     found: set[str] = set()
@@ -161,8 +140,7 @@ def _extract_emails_from_response(resp: requests.Response) -> set[str]:
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
-            # Walk the JSON looking for "email" keys
-            stack = [data] if isinstance(data, dict) else data if isinstance(data, list) else []
+            stack = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
             while stack:
                 node = stack.pop()
                 if isinstance(node, dict):
@@ -192,8 +170,9 @@ def _extract_emails_from_response(resp: requests.Response) -> set[str]:
     for m in _OBFUSCATED_AT.finditer(raw):
         normalised = (
             m.group()
-            .replace("[at]", "@").replace(" at ", "@").replace("&#64;", "@")
-            .replace("%40", "@").replace(" ", "")
+            .replace("[at]", "@").replace(" at ", "@")
+            .replace("&#64;", "@").replace("%40", "@")
+            .replace(" ", "")
         )
         if EMAIL_RE.fullmatch(normalised):
             found.add(normalised.lower())
@@ -202,12 +181,6 @@ def _extract_emails_from_response(resp: requests.Response) -> set[str]:
 
 
 def scrape_all_emails(website: str) -> list[str]:
-    """
-    Fetch standard paths plus extra staff/team pages and extract emails
-    using multiple strategies (mailto, regex, JSON-LD, schema.org,
-    obfuscation patterns). Falls back to extra paths if no email found
-    on primary paths. Returns sorted, deduplicated list.
-    """
     if not website:
         return []
     if not website.startswith("http"):
@@ -215,24 +188,17 @@ def scrape_all_emails(website: str) -> list[str]:
 
     parsed = urlparse(website)
     base = f"{parsed.scheme}://{parsed.netloc}"
-
     found: set[str] = set()
 
     def _fetch_and_extract(paths: list[str]) -> None:
         for path in paths:
             url = base + path
             try:
-                resp = requests.get(
-                    url,
-                    timeout=SCRAPE_TIMEOUT,
-                    headers=BROWSER_HEADERS,
-                    allow_redirects=True,
-                )
+                resp = requests.get(url, timeout=SCRAPE_TIMEOUT, headers=BROWSER_HEADERS, allow_redirects=True)
                 resp.raise_for_status()
             except Exception as exc:
                 log.debug("    scrape %s → FAILED: %s", url, exc)
                 continue
-
             log.debug("    scrape %s → %d bytes, status %d", url, len(resp.content), resp.status_code)
             page_emails = _extract_emails_from_response(resp)
             if page_emails:
@@ -240,18 +206,12 @@ def scrape_all_emails(website: str) -> list[str]:
             found.update(page_emails)
 
     _fetch_and_extract(SCRAPE_PATHS)
-
-    # If primary paths yielded nothing, try staff/team pages
     if not found:
         log.debug("    no emails from primary paths, trying staff/team pages…")
         _fetch_and_extract(SCRAPE_PATHS_EXTRA)
 
-    # Drop file-extension false positives
     before_filter = set(found)
-    found = {
-        e for e in found
-        if not any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg"))
-    }
+    found = {e for e in found if not any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg"))}
     rejected = before_filter - found
     if rejected:
         log.debug("    rejected (bad extension): %s", sorted(rejected))
@@ -273,21 +233,10 @@ def _get_validation_client() -> anthropic.Anthropic:
 
 
 def _null_validation(reason: str) -> dict:
-    return {
-        "best_email": None,
-        "email_confidence": "low",
-        "phone_is_fax": False,
-        "reason": reason,
-    }
+    return {"best_email": None, "email_confidence": "low", "phone_is_fax": False, "reason": reason}
 
 
 def validate_contacts_batch(practices: list[dict]) -> list[dict]:
-    """
-    Send all practices to Claude in one call. Returns a list of validation
-    dicts (same order as input):
-      {best_email, email_confidence, phone_is_fax, reason}
-    Falls back to _null_validation for any practice that can't be parsed.
-    """
     if not practices:
         return []
 
@@ -333,14 +282,11 @@ def validate_contacts_batch(practices: list[dict]) -> list[dict]:
             return [_null_validation("could not parse batch response")] * len(practices)
 
         results = json.loads(match.group())
-
-        # Normalise and pad to match input length
         validated = []
         for i, p in enumerate(practices):
             r = results[i] if i < len(results) else {}
             if not isinstance(r, dict):
                 r = {}
-            # Normalise JSON null / string "null" → Python None
             email = r.get("best_email")
             if isinstance(email, str) and email.lower() in ("null", "none", ""):
                 email = None
@@ -358,20 +304,42 @@ def validate_contacts_batch(practices: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Brevo
+# Step 5 — Brevo (single source of truth)
 # ---------------------------------------------------------------------------
 
-def add_to_brevo(practice: dict, email: str, confidence: str) -> str:
+def _brevo_headers() -> dict:
+    return {"api-key": BREVO_API_KEY, "Content-Type": "application/json"}
+
+
+def check_brevo_exists(phone: str) -> bool:
     """
-    POST the contact to Brevo.
-    Returns "added", "duplicate", or "error".
-    In DRY_RUN mode returns "added" without calling the API.
+    Return True if a contact with this phone number already exists in Brevo.
+    Uses GET /v3/contacts/{identifier}?identifierType=phone_number.
+    Returns False on any error (fail open — better to attempt add than to skip).
     """
+    digits = normalize_phone(phone)
+    if not digits:
+        return False
+    try:
+        resp = requests.get(
+            f"https://api.brevo.com/v3/contacts/{digits}",
+            params={"identifierType": "phone_number"},
+            headers=_brevo_headers(),
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except requests.RequestException as exc:
+        log.warning("Brevo existence check failed for phone %s: %s", digits, exc)
+        return False
+
+
+def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
+    """Add a contact with a validated email to BREVO_LIST_ID."""
     name = practice.get("name", "")
-    phone = practice.get("phone", "")  # already cleared if fax
+    phone = practice.get("phone", "")
 
     if DRY_RUN:
-        log.info("[DRY RUN] Would add to Brevo: %s <%s> [%s]", name, email, confidence)
+        log.info("[DRY RUN] Would add to Brevo email list: %s <%s> [%s]", name, email, confidence)
         return "added"
 
     payload = {
@@ -384,6 +352,7 @@ def add_to_brevo(practice: dict, email: str, confidence: str) -> str:
             "PRACTICE_NAME": name,
             "SPECIALTY": practice.get("specialty", ""),
             "CITY": practice.get("city", ""),
+            "CONTACT_STATUS": "email_found",
         },
         "updateEnabled": False,
     }
@@ -391,21 +360,67 @@ def add_to_brevo(practice: dict, email: str, confidence: str) -> str:
         resp = requests.post(
             "https://api.brevo.com/v3/contacts",
             json=payload,
-            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            headers=_brevo_headers(),
             timeout=15,
         )
         if resp.status_code == 201:
             return "added"
-        if resp.status_code == 400:
-            code = resp.json().get("code", "")
-            if "duplicate" in code.lower():
-                return "duplicate"
-        log.warning(
-            "Brevo returned %d for <%s>: %s", resp.status_code, email, resp.text[:200]
-        )
+        if resp.status_code == 400 and "duplicate" in resp.json().get("code", "").lower():
+            return "duplicate"
+        log.warning("Brevo email list returned %d for <%s>: %s", resp.status_code, email, resp.text[:200])
         return "error"
     except requests.RequestException as exc:
         log.error("Brevo request failed for <%s>: %s", email, exc)
+        return "error"
+
+
+def add_to_brevo_call_list(practice: dict, reason: str) -> str:
+    """
+    Add a contact WITHOUT a validated email to BREVO_CALL_LIST_ID.
+    No email field is sent — Brevo allows emailless contacts when only
+    attributes + listIds are provided.
+    """
+    name = practice.get("name", "")
+    phone = practice.get("phone", "")
+
+    if not BREVO_CALL_LIST_ID:
+        log.warning("BREVO_CALL_LIST_ID not set — skipping call-list contact: %s", name)
+        return "skipped"
+
+    if DRY_RUN:
+        log.info("[DRY RUN] Would add to Brevo call list: %s [%s]", name, reason)
+        return "added"
+
+    payload = {
+        "listIds": [BREVO_CALL_LIST_ID],
+        "attributes": {
+            "PRACTICE_NAME": name,
+            "PHONE": phone,
+            "SPECIALTY": practice.get("specialty", ""),
+            "CITY": practice.get("city", ""),
+            "ADDRESS": practice.get("address", ""),
+            "WEBSITE": practice.get("website", ""),
+            "CONTACT_STATUS": "call_needed",
+            "EMAIL_FOUND": "false",
+            "CALL_REASON": reason,
+        },
+        "updateEnabled": False,
+    }
+    try:
+        resp = requests.post(
+            "https://api.brevo.com/v3/contacts",
+            json=payload,
+            headers=_brevo_headers(),
+            timeout=15,
+        )
+        if resp.status_code == 201:
+            return "added"
+        if resp.status_code == 400 and "duplicate" in resp.json().get("code", "").lower():
+            return "duplicate"
+        log.warning("Brevo call list returned %d for %s: %s", resp.status_code, name, resp.text[:200])
+        return "error"
+    except requests.RequestException as exc:
+        log.error("Brevo call list request failed for %s: %s", name, exc)
         return "error"
 
 
@@ -429,10 +444,10 @@ def run() -> None:
         if not BREVO_LIST_ID:
             log.error("BREVO_LIST_ID is not set. Exiting.")
             return
+        if not BREVO_CALL_LIST_ID:
+            log.warning("BREVO_CALL_LIST_ID not set — no-email contacts will be skipped")
 
-    brevo_rows: list[dict] = []
-    call_rows: list[dict] = []
-    counts = {"added": 0, "call_list": 0, "duplicate": 0, "error": 0}
+    counts = {"email_added": 0, "call_added": 0, "duplicate": 0, "skipped": 0, "error": 0}
 
     # -------------------------------------------------------------------
     # STEP 1a — NPI Registry (authoritative, no API key needed)
@@ -461,8 +476,6 @@ def run() -> None:
 
     # -------------------------------------------------------------------
     # STEP 1b — Claude finds additional practices
-    # NPI data already registered in seen_phones/seen_domains so Claude
-    # results that duplicate NPI entries are dropped automatically.
     # -------------------------------------------------------------------
     log.info("\n--- STEP 1b: Claude finding additional practices ---")
 
@@ -496,7 +509,7 @@ def run() -> None:
     else:
         for p in all_practices:
             if p.get("website") and p.get("phone"):
-                continue  # nothing to fill
+                continue
             before_website = p.get("website", "")
             before_phone = p.get("phone", "")
             enriched = enrich_practice(p)
@@ -519,10 +532,7 @@ def run() -> None:
         if website:
             emails = scrape_all_emails(website)
             p["_candidate_emails"] = emails
-            log.info(
-                "  %s → %d email(s) found  [%s]",
-                p.get("name"), len(emails), website,
-            )
+            log.info("  %s → %d email(s) found  [%s]", p.get("name"), len(emails), website)
         else:
             log.info("  %s → no website, skipping scrape", p.get("name"))
             p["_candidate_emails"] = []
@@ -532,7 +542,6 @@ def run() -> None:
     # -------------------------------------------------------------------
     log.info("\n--- STEP 4: Claude validating contacts ---")
 
-    # Separate practices with contact info from those without
     to_validate = [p for p in all_practices if p.get("_candidate_emails") or p.get("phone")]
     no_info = [p for p in all_practices if not p.get("_candidate_emails") and not p.get("phone")]
 
@@ -548,9 +557,9 @@ def run() -> None:
                 p["phone"] = ""
 
     # -------------------------------------------------------------------
-    # STEP 5 — Route to Brevo or call list
+    # STEP 5 — Route everything to Brevo (single source of truth)
     # -------------------------------------------------------------------
-    log.info("\n--- STEP 5: Routing ---")
+    log.info("\n--- STEP 5: Routing to Brevo ---")
 
     for p in all_practices:
         name = p.get("name", "Unknown")
@@ -559,30 +568,25 @@ def run() -> None:
         confidence: str = v.get("email_confidence", "low")
         phone: str = p.get("phone", "")
 
-        if best_email and confidence in ("high", "medium"):
-            result = add_to_brevo(p, best_email, confidence)
+        # Dedup: check Brevo by phone before adding anything
+        if phone and not DRY_RUN and check_brevo_exists(phone):
+            print(f"⟳  {name} → already in Brevo, skipping")
+            counts["duplicate"] += 1
+            continue
 
+        if best_email and confidence in ("high", "medium"):
+            result = add_to_brevo_email_list(p, best_email, confidence)
             if result == "added":
-                print(f"✓  {name} → Brevo ({best_email}) [{confidence}]")
-                counts["added"] += 1
-                brevo_rows.append({
-                    "Practice Name": name,
-                    "Email": best_email,
-                    "Confidence": confidence,
-                    "City": p.get("city", ""),
-                    "Specialty": p.get("specialty", ""),
-                    "Phone": phone,
-                    "Website": p.get("website", ""),
-                })
+                print(f"✓  {name} → Brevo email list ({best_email}) [{confidence}]")
+                counts["email_added"] += 1
             elif result == "duplicate":
-                print(f"⟳  {name} → duplicate, skipped")
+                print(f"⟳  {name} → duplicate in Brevo, skipping")
                 counts["duplicate"] += 1
             else:
                 print(f"✗  {name} → Brevo error")
                 counts["error"] += 1
-
         else:
-            # Determine a human-readable reason for the call list
+            # Determine reason for the call list
             if not p.get("website") and not phone:
                 reason = "no contact info found"
             elif v.get("phone_is_fax") and not best_email:
@@ -594,54 +598,27 @@ def run() -> None:
             else:
                 reason = v.get("reason") or "no valid email"
 
-            print(f"📞  {name} → call list ({reason})")
-            counts["call_list"] += 1
-            call_rows.append({
-                "Practice Name": name,
-                "Phone": phone,
-                "Website": p.get("website", ""),
-                "Specialty": p.get("specialty", ""),
-                "City": p.get("city", ""),
-                "Address": p.get("address", ""),
-                "Reason": reason,
-            })
+            result = add_to_brevo_call_list(p, reason)
+            if result == "added":
+                print(f"📞  {name} → Brevo call list ({reason})")
+                counts["call_added"] += 1
+            elif result in ("duplicate", "skipped"):
+                counts["skipped"] += 1
+            else:
+                print(f"✗  {name} → Brevo call list error")
+                counts["error"] += 1
 
     # -------------------------------------------------------------------
-    # STEP 6 — Save CSVs and print summary
+    # STEP 6 — Summary
     # -------------------------------------------------------------------
-    log.info("\n--- STEP 6: Saving output ---")
-
-    if brevo_rows:
-        with open(BREVO_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=BREVO_HEADERS)
-            writer.writeheader()
-            writer.writerows(brevo_rows)
-
-    if call_rows:
-        with open(CALL_LIST_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CALL_LIST_HEADERS)
-            writer.writeheader()
-            writer.writerows(call_rows)
-
-    # Brevo rows lack an Address field — backfill with empty string so
-    # sheets_client always receives a consistent dict shape.
-    for r in brevo_rows:
-        r.setdefault("Address", "")
-
-    log.info("\n--- STEP 6b: Appending to Google Sheet ---")
-    append_to_sheet(call_rows, brevo_rows)
-
     print()
     print(
-        f"Done: {counts['added']} → Brevo | "
-        f"{counts['call_list']} → call list | "
+        f"Done: {counts['email_added']} → email list | "
+        f"{counts['call_added']} → call list | "
         f"{counts['duplicate']} duplicates | "
+        f"{counts['skipped']} skipped | "
         f"{counts['error']} errors"
     )
-    if call_rows:
-        print(f"Call list saved to {CALL_LIST_CSV}")
-    if brevo_rows:
-        print(f"Brevo contacts saved to {BREVO_CSV}")
 
 
 if __name__ == "__main__":
