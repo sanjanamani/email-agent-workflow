@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from claude_finder import find_all_practices, CITIES
 from npi_client import fetch_npi_practices
 from serper_enricher import enrich_practice
+from sheets_client import append_to_sheet
 
 load_dotenv()
 
@@ -621,6 +622,14 @@ def run() -> None:
             writer = csv.DictWriter(f, fieldnames=CALL_LIST_HEADERS)
             writer.writeheader()
             writer.writerows(call_rows)
+
+    # Brevo rows lack an Address field — backfill with empty string so
+    # sheets_client always receives a consistent dict shape.
+    for r in brevo_rows:
+        r.setdefault("Address", "")
+
+    log.info("\n--- STEP 6b: Appending to Google Sheet ---")
+    append_to_sheet(call_rows, brevo_rows)
 
     print()
     print(
