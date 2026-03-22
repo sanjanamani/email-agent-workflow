@@ -10,6 +10,8 @@ import json
 import logging
 import os
 import re
+import time
+from datetime import datetime, timezone
 
 import anthropic
 from dotenv import load_dotenv
@@ -129,20 +131,68 @@ def find_practices(specialty: str) -> list[dict]:
         log.info("Claude found %d practices for %s", len(practices), specialty)
         return practices
 
+    except anthropic.RateLimitError as exc:
+        wait = _retry_after(exc)
+        log.warning("Rate limited for %s. Waiting %ds (from retry-after header)…", specialty, wait)
+        time.sleep(wait)
+        # One retry after sleeping
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_content}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            )
+            text = "".join(b.text for b in response.content if b.type == "text")
+            practices = _extract_json_array(text)
+            log.info("Claude found %d practices for %s (retry)", len(practices), specialty)
+            return practices
+        except anthropic.APIError as retry_exc:
+            log.error("Claude API error for %s on retry: %s", specialty, retry_exc)
+            return []
     except anthropic.APIError as exc:
         log.error("Claude API error for %s: %s", specialty, exc)
         return []
 
 
-INTER_SPECIALTY_DELAY = 65  # seconds between specialty calls to refill token bucket
+def _retry_after(exc: anthropic.RateLimitError, buffer: int = 10) -> int:
+    """
+    Read retry-after seconds from the exception's response headers.
+    Falls back to 200s if the header is absent or unparseable.
+    """
+    fallback = 200
+    try:
+        headers = exc.response.headers  # type: ignore[attr-defined]
+        val = headers.get("retry-after", "")
+        if val:
+            return int(val) + buffer
+        # Also try the reset timestamp header
+        reset = headers.get("anthropic-ratelimit-input-tokens-reset", "")
+        if reset:
+            reset_dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+            secs = int((reset_dt - datetime.now(timezone.utc)).total_seconds()) + buffer
+            return max(secs, buffer)
+    except Exception:
+        pass
+    return fallback
 
 
 def find_all_practices(specialties: list[str]) -> list[dict]:
-    """Call find_practices for each specialty, sleeping between calls."""
+    """
+    Call find_practices for each specialty, sleeping between calls so the
+    token bucket refills. Reads the wait time dynamically from the API
+    response headers when possible.
+    """
+    print(
+        "Note: if you just ran this script, wait 3-4 minutes before running "
+        "again to let the token bucket refill."
+    )
     all_results: list[dict] = []
     for i, specialty in enumerate(specialties):
         if i > 0:
-            log.info("Sleeping %ds between specialty calls to refill token bucket…", INTER_SPECIALTY_DELAY)
-            time.sleep(INTER_SPECIALTY_DELAY)
+            wait = 65  # default inter-specialty gap
+            log.info("Sleeping %ds between specialty calls to refill token bucket…", wait)
+            time.sleep(wait)
         all_results.extend(find_practices(specialty))
     return all_results
