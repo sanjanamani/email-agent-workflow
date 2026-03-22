@@ -124,7 +124,7 @@ def _fetch_one(taxonomy_desc: str, enumeration_type: str, city: str, specialty: 
 
     practices = []
     for result in results:
-        practice = _parse_result(result, specialty, enum_type)
+        practice = _parse_result(result, specialty, enumeration_type)
         if practice:
             practices.append(practice)
     return practices
