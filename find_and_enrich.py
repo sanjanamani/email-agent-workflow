@@ -55,7 +55,6 @@ DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 MAX_PRACTICES: int = int(os.getenv("MAX_PRACTICES", "300"))
 
 SPECIALTIES = ["endocrinologist", "orthopedic surgeon"]
-CITIES = ["Dallas", "Plano", "Frisco", "Allen", "McKinney", "Richardson"]
 
 VALIDATION_MODEL = "claude-haiku-4-5-20251001"
 
@@ -343,26 +342,23 @@ def run() -> None:
     seen_domains: set[str] = set()
 
     for specialty in SPECIALTIES:
-        for city in CITIES:
-            log.info("Querying Claude: %s in %s", specialty, city)
-            results = find_practices(specialty, city)
+        log.info("Querying Claude: %s (all cities)", specialty)
+        results = find_practices(specialty)
 
-            added = 0
-            for p in results:
-                if len(all_practices) >= MAX_PRACTICES:
-                    break
-                if is_duplicate(p, seen_phones, seen_domains):
-                    log.debug("  skip duplicate: %s", p.get("name"))
-                    continue
-                register(p, seen_phones, seen_domains)
-                all_practices.append(p)
-                added += 1
-
-            log.info("  → %d new practices (running total: %d)", added, len(all_practices))
+        added = 0
+        for p in results:
             if len(all_practices) >= MAX_PRACTICES:
-                log.info("MAX_PRACTICES=%d reached, stopping search", MAX_PRACTICES)
                 break
+            if is_duplicate(p, seen_phones, seen_domains):
+                log.debug("  skip duplicate: %s", p.get("name"))
+                continue
+            register(p, seen_phones, seen_domains)
+            all_practices.append(p)
+            added += 1
+
+        log.info("  → %d new practices (running total: %d)", added, len(all_practices))
         if len(all_practices) >= MAX_PRACTICES:
+            log.info("MAX_PRACTICES=%d reached, stopping search", MAX_PRACTICES)
             break
 
     log.info("Claude found %d unique practices", len(all_practices))
