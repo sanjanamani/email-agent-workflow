@@ -74,6 +74,10 @@ def _extract_json_array(text: str) -> list[dict]:
         return []
 
 
+RATE_LIMIT_WAIT = 65   # seconds to pause after a 429 (token bucket refills per minute)
+INTER_CALL_DELAY = 10  # seconds between successful calls
+
+
 def find_practices(specialty: str, city: str) -> list[dict]:
     """
     Use Claude + web search to find real independent specialty clinics in city.
@@ -82,55 +86,66 @@ def find_practices(specialty: str, city: str) -> list[dict]:
       {name, website, phone, address, city, specialty}
 
     Returns [] on any error or empty result.
-    1-second delay on exit (rate limiting).
+    Waits INTER_CALL_DELAY seconds after each call, and RATE_LIMIT_WAIT seconds
+    when a 429 is received before retrying (up to 3 times).
     """
     client = _get_client()
     user_content = _user_prompt(specialty, city)
-    messages: list[dict] = [{"role": "user", "content": user_content}]
-    response = None
 
-    try:
-        for _ in range(MAX_CONTINUATIONS):
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+    for attempt in range(3):
+        messages: list[dict] = [{"role": "user", "content": user_content}]
+        response = None
+        try:
+            for _ in range(MAX_CONTINUATIONS):
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=2000,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                )
+
+                if response.stop_reason == "end_turn":
+                    break
+                elif response.stop_reason == "pause_turn":
+                    # Server-side tool hit iteration limit; re-send to let it continue.
+                    messages = [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": response.content},
+                    ]
+                else:
+                    break
+
+            if response is None:
+                return []
+
+            text = "".join(
+                block.text for block in response.content if block.type == "text"
             )
+            if not text:
+                log.warning("No text in Claude response for %s / %s", specialty, city)
+                return []
 
-            if response.stop_reason == "end_turn":
-                break
-            elif response.stop_reason == "pause_turn":
-                # Server-side tool hit iteration limit; re-send to let it continue.
-                # Do NOT add a new user message — the API detects the trailing
-                # server_tool_use block and resumes automatically.
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": response.content},
-                ]
+            practices = _extract_json_array(text)
+            log.info(
+                "Claude found %d practices for %s / %s", len(practices), specialty, city
+            )
+            return practices
+
+        except anthropic.RateLimitError as exc:
+            if attempt < 2:
+                log.warning(
+                    "Rate limited for %s / %s (attempt %d/3). Waiting %ds…",
+                    specialty, city, attempt + 1, RATE_LIMIT_WAIT,
+                )
+                time.sleep(RATE_LIMIT_WAIT)
             else:
-                # Unexpected stop reason; use whatever we have
-                break
-
-        if response is None:
+                log.error("Claude API error for %s / %s: %s", specialty, city, exc)
+                return []
+        except anthropic.APIError as exc:
+            log.error("Claude API error for %s / %s: %s", specialty, city, exc)
             return []
+        finally:
+            time.sleep(INTER_CALL_DELAY)
 
-        text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-        if not text:
-            log.warning("No text in Claude response for %s / %s", specialty, city)
-            return []
-
-        practices = _extract_json_array(text)
-        log.info(
-            "Claude found %d practices for %s / %s", len(practices), specialty, city
-        )
-        return practices
-
-    except anthropic.APIError as exc:
-        log.error("Claude API error for %s / %s: %s", specialty, city, exc)
-        return []
-    finally:
-        time.sleep(1)
+    return []
