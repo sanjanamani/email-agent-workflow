@@ -1,31 +1,39 @@
 """
-find_and_enrich.py — Finds independent endocrinology and orthopedic practices
-in DFW via Google Maps, scrapes their websites for a contact email, then either
-adds the contact to Brevo or appends them to call_list.csv.
+find_and_enrich.py — Orchestrates practice discovery, email scraping,
+Claude validation, and routing to Brevo or call_list.csv.
 
-Usage:
-    python find_and_enrich.py
+Pipeline:
+  1. Claude finds practices via web search (all 12 specialty × city combos)
+  2. Serper fills gaps (phone, website, address) where missing
+  3. Scrape each practice website for candidate email addresses
+  4. Claude validates emails and flags fax numbers
+  5. Route: email found → Brevo | no valid email → call_list.csv
+  6. Save brevo_added.csv + call_list.csv, print summary
 
-Required env vars:
-    GOOGLE_MAPS_API_KEY
-    BREVO_API_KEY
-    BREVO_LIST_ID
-
-Optional env vars:
-    DRY_RUN          - set to "true" to print actions without calling APIs
-    MAX_PRACTICES    - cap total practices processed (default 100)
+ENV VARS:
+  ANTHROPIC_API_KEY   required
+  SERPER_API_KEY      optional (enrichment skipped if absent)
+  BREVO_API_KEY       required unless DRY_RUN=true
+  BREVO_LIST_ID       required unless DRY_RUN=true  (default: 7)
+  DRY_RUN             "true" → print actions, skip API writes, still save CSVs
+  MAX_PRACTICES       cap on total practices (default: 300)
 """
 
 import csv
+import json
+import logging
 import os
 import re
 import time
-import logging
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
+import anthropic
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+from claude_finder import find_practices
+from serper_enricher import enrich_practice
 
 load_dotenv()
 
@@ -40,371 +48,474 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
-BREVO_LIST_ID = int(os.getenv("BREVO_LIST_ID", "0"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
-MAX_PRACTICES = int(os.getenv("MAX_PRACTICES", "100"))
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+BREVO_API_KEY: str = os.getenv("BREVO_API_KEY", "")
+BREVO_LIST_ID: int = int(os.getenv("BREVO_LIST_ID", "7"))
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+MAX_PRACTICES: int = int(os.getenv("MAX_PRACTICES", "300"))
 
-SPECIALTIES = ["endocrinology", "orthopedic"]
-CITIES = ["Dallas TX", "Plano TX", "Frisco TX", "Allen TX", "McKinney TX", "Richardson TX"]
+SPECIALTIES = ["endocrinologist", "orthopedic surgeon"]
+CITIES = ["Dallas", "Plano", "Frisco", "Allen", "McKinney", "Richardson"]
+
+VALIDATION_MODEL = "claude-haiku-4-5-20251001"
 
 CALL_LIST_CSV = "call_list.csv"
-CALL_LIST_HEADERS = ["Practice Name", "Phone", "Website", "Specialty", "City", "Priority"]
+BREVO_CSV = "brevo_added.csv"
 
-SCRAPE_PATHS = ["", "/contact", "/about"]
-SCRAPE_TIMEOUT = 10
-REQUEST_DELAY = 1  # seconds between practices
-
-# Emails that don't reach a real person
-SKIP_PREFIXES = {"noreply", "no-reply", "info", "support", "admin"}
-
-# Hospital / health-system keywords — matched against practice name + address
-HOSPITAL_KEYWORDS = [
-    "hospital", "health system", "health network", "medical center",
-    "ut southwestern", "utsw", "baylor", "hca", "tenet", "methodist",
-    "parkland", "children's health", "childrens health", "texas health",
-    "university", "academic medical", "veterans affairs", "va clinic",
-    "kaiser", "dignity health", "commonspirit", "ascension",
+CALL_LIST_HEADERS = [
+    "Practice Name", "Phone", "Website", "Specialty", "City", "Address", "Reason",
+]
+BREVO_HEADERS = [
+    "Practice Name", "Email", "Confidence", "City", "Specialty", "Phone", "Website",
 ]
 
-# Review keywords that indicate high priority for the call list
-HIGH_PRIORITY_KEYWORDS = ["prior authorization", "insurance", "prior auth", "preauthorization"]
+SCRAPE_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
+SCRAPE_TIMEOUT = 6
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+# ---------------------------------------------------------------------------
+# Deduplication helpers
+# ---------------------------------------------------------------------------
+
+def normalize_phone(phone: str) -> str:
+    """Strip everything except digits."""
+    return re.sub(r"\D", "", phone or "")
+
+
+def extract_domain(website: str) -> str:
+    """Return bare domain (no www, no path) or empty string."""
+    if not website:
+        return ""
+    if not website.startswith("http"):
+        website = f"https://{website}"
+    try:
+        netloc = urlparse(website).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except Exception:
+        return ""
+
+
+def is_duplicate(
+    practice: dict, seen_phones: set[str], seen_domains: set[str]
+) -> bool:
+    phone = normalize_phone(practice.get("phone", ""))
+    domain = extract_domain(practice.get("website", ""))
+    return (bool(phone) and phone in seen_phones) or (
+        bool(domain) and domain in seen_domains
     )
-}
+
+
+def register(
+    practice: dict, seen_phones: set[str], seen_domains: set[str]
+) -> None:
+    phone = normalize_phone(practice.get("phone", ""))
+    domain = extract_domain(practice.get("website", ""))
+    if phone:
+        seen_phones.add(phone)
+    if domain:
+        seen_domains.add(domain)
+
 
 # ---------------------------------------------------------------------------
-# Google Maps helpers
+# Step 3 — Email scraping
 # ---------------------------------------------------------------------------
 
-def search_places(query: str) -> list[dict]:
-    """Text-search Google Maps Places API and return raw place results."""
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {"query": query, "key": GOOGLE_MAPS_API_KEY}
-    results = []
-    while True:
+def scrape_all_emails(website: str) -> list[str]:
+    """
+    Fetch homepage, /contact, /contact-us, /about, /about-us and collect
+    ALL email addresses (mailto: links + regex on page text).
+    Returns sorted, deduplicated list. Skips pages that error or time out.
+    """
+    if not website:
+        return []
+    if not website.startswith("http"):
+        website = f"https://{website}"
+
+    parsed = urlparse(website)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    found: set[str] = set()
+    for path in SCRAPE_PATHS:
         try:
-            resp = requests.get(url, params=params, timeout=15)
+            resp = requests.get(
+                base + path,
+                timeout=SCRAPE_TIMEOUT,
+                headers=BROWSER_HEADERS,
+                allow_redirects=True,
+            )
             resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
-            log.error("Maps search failed for %r: %s", query, exc)
-            break
-        results.extend(data.get("results", []))
-        token = data.get("next_page_token")
-        if not token:
-            break
-        params = {"pagetoken": token, "key": GOOGLE_MAPS_API_KEY}
-        time.sleep(2)  # Maps API requires a short pause before using next_page_token
-    return results
+        except Exception:
+            continue
 
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-def get_place_details(place_id: str) -> dict:
-    """Fetch website, phone, and reviews for a place."""
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    params = {
-        "place_id": place_id,
-        "fields": "website,formatted_phone_number,reviews",
-        "key": GOOGLE_MAPS_API_KEY,
+        # mailto: links are most reliable
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"]
+            if href.lower().startswith("mailto:"):
+                addr = href[7:].split("?")[0].strip().lower()
+                if EMAIL_RE.fullmatch(addr):
+                    found.add(addr)
+
+        # Plain-text regex scan
+        for m in EMAIL_RE.finditer(soup.get_text(" ")):
+            found.add(m.group().lower())
+
+    # Drop file-extension false positives
+    found = {
+        e for e in found
+        if not any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg"))
     }
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("result", {})
-    except requests.RequestException as exc:
-        log.warning("Place details fetch failed for %s: %s", place_id, exc)
-        return {}
-
-
-def is_independent_practice(name: str, address: str) -> bool:
-    """Return True if this looks like a solo/small-group practice."""
-    text = (name + " " + address).lower()
-    return not any(kw in text for kw in HOSPITAL_KEYWORDS)
-
-
-def extract_city(address: str) -> str:
-    """Pull the city name from a formatted Maps address string."""
-    parts = [p.strip() for p in address.split(",")]
-    # Address format: "Street, City, ST ZIP, USA"
-    return parts[1] if len(parts) >= 3 else ""
-
-
-def reviews_suggest_high_priority(reviews: list[dict]) -> bool:
-    """Return True if any review mentions prior-auth or insurance friction."""
-    for review in reviews:
-        text = review.get("text", "").lower()
-        if any(kw in text for kw in HIGH_PRIORITY_KEYWORDS):
-            return True
-    return False
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------
-# Email scraping helpers
+# Step 4 — Claude validates email + phone
 # ---------------------------------------------------------------------------
 
-def scrape_emails_from_url(url: str) -> set[str]:
-    """Fetch one URL and return all valid email addresses found on the page."""
+_validation_client: anthropic.Anthropic | None = None
+
+
+def _get_validation_client() -> anthropic.Anthropic:
+    global _validation_client
+    if _validation_client is None:
+        _validation_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _validation_client
+
+
+def validate_contact(practice: dict, candidate_emails: list[str]) -> dict:
+    """
+    Ask Claude (no web search) to:
+      1. Pick the best email for a practice manager / billing coordinator.
+         Reject: noreply, no-reply, info@, admin@, support@, webmaster@,
+         privacy@, press@, media@, patient-portal-style addresses.
+      2. Flag whether the phone number looks like a fax line.
+
+    Returns:
+      {best_email: str|None, email_confidence: "high"|"medium"|"low",
+       phone_is_fax: bool, reason: str}
+    """
+    prompt = f"""You are validating contact info for a medical practice.
+
+Practice: {practice['name']} ({practice.get('specialty', '')}, {practice.get('city', '')} TX)
+Website: {practice.get('website', '')}
+Phone found: {practice.get('phone', '')}
+Candidate emails found on website: {candidate_emails}
+
+Tasks:
+1. Pick the best email for reaching a practice manager or billing
+   coordinator. Reject: noreply, no-reply, info@, admin@, support@,
+   webmaster@, privacy@, press@, media@, anything that looks like
+   a patient portal login or generic department inbox.
+   Pick a direct staff email if available.
+2. Flag if the phone number looks like a fax (fax numbers are often
+   listed near 'fax:' text — if you see evidence it's a fax, mark it)
+
+Return ONLY this JSON:
+{{
+  "best_email": "chosen@email.com or null",
+  "email_confidence": "high/medium/low",
+  "phone_is_fax": true/false,
+  "reason": "one sentence explanation"
+}}"""
+
     try:
-        resp = requests.get(
-            url, timeout=SCRAPE_TIMEOUT, headers=BROWSER_HEADERS, allow_redirects=True
+        client = _get_validation_client()
+        response = client.messages.create(
+            model=VALIDATION_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
         )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.debug("Could not fetch %s: %s", url, exc)
-        return set()
+        text = "".join(b.text for b in response.content if b.type == "text")
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return _null_validation("could not parse validation response")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    emails: set[str] = set()
+        result = json.loads(match.group())
 
-    # mailto: links first (most reliable)
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"]
-        if href.lower().startswith("mailto:"):
-            addr = href[7:].split("?")[0].strip().lower()
-            if EMAIL_RE.fullmatch(addr):
-                emails.add(addr)
+        # Normalise JSON null / string "null" → Python None
+        if isinstance(result.get("best_email"), str) and result["best_email"].lower() in (
+            "null", "none", ""
+        ):
+            result["best_email"] = None
 
-    # Plain-text scan
-    for match in EMAIL_RE.finditer(soup.get_text(" ")):
-        emails.add(match.group().lower())
+        return result
 
-    # Drop false positives (image paths, etc.)
-    emails = {e for e in emails if not e.split("@")[0].endswith((".png", ".jpg", ".gif", ".svg"))}
-    return emails
+    except (anthropic.APIError, json.JSONDecodeError) as exc:
+        log.error("Validation error for %r: %s", practice.get("name"), exc)
+        return _null_validation(str(exc))
 
 
-def find_contact_email(website: str) -> str:
-    """
-    Scrape homepage, /contact, and /about for a usable contact email.
-    Returns an empty string if none is found.
-    """
-    if not website:
-        return ""
-
-    # Normalise base URL
-    parsed = urlparse(website if website.startswith("http") else f"https://{website}")
-    base = f"{parsed.scheme}://{parsed.netloc}"
-
-    for path in SCRAPE_PATHS:
-        url = base + path
-        emails = scrape_emails_from_url(url)
-        # Prefer non-generic emails; fall back to any human-reachable one
-        personal = [e for e in emails if e.split("@")[0] not in SKIP_PREFIXES]
-        if personal:
-            return personal[0]
-        if emails:
-            # All are generic — save for fallback but keep looking
-            fallback = next(iter(emails))
-
-    # If we only found generic addresses across all pages, return the first one
-    # (already filtered to exclude noreply/support/admin/info at caller)
-    return ""
-
-
-def pick_email(website: str) -> str:
-    """
-    Return a usable email from the website, or '' if none found.
-    Skips any address whose local part is in SKIP_PREFIXES.
-    """
-    if not website:
-        return ""
-
-    parsed = urlparse(website if website.startswith("http") else f"https://{website}")
-    base = f"{parsed.scheme}://{parsed.netloc}"
-
-    for path in SCRAPE_PATHS:
-        url = base + path
-        emails = scrape_emails_from_url(url)
-        for email in sorted(emails):
-            local = email.split("@")[0]
-            if local not in SKIP_PREFIXES:
-                return email
-
-    return ""
+def _null_validation(reason: str) -> dict:
+    return {
+        "best_email": None,
+        "email_confidence": "low",
+        "phone_is_fax": False,
+        "reason": reason,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Brevo helpers
+# Step 5 — Brevo
 # ---------------------------------------------------------------------------
 
-def add_to_brevo(email: str, practice_name: str, phone: str) -> str:
+def add_to_brevo(practice: dict, email: str, confidence: str) -> str:
     """
-    POST the contact to Brevo. Returns:
-        "added"     — new contact created
-        "duplicate" — contact already exists
-        "error"     — some other failure
+    POST the contact to Brevo.
+    Returns "added", "duplicate", or "error".
+    In DRY_RUN mode returns "added" without calling the API.
     """
+    name = practice.get("name", "")
+    phone = practice.get("phone", "")  # already cleared if fax
+
     if DRY_RUN:
-        log.info("[DRY RUN] Would add to Brevo: %s <%s>", practice_name, email)
+        log.info("[DRY RUN] Would add to Brevo: %s <%s> [%s]", name, email, confidence)
         return "added"
 
     payload = {
         "email": email,
+        "listIds": [BREVO_LIST_ID],
         "attributes": {
             "FIRSTNAME": "",
-            "LASTNAME": practice_name,
+            "LASTNAME": name,
             "PHONE": phone,
-            "SMS": phone,
+            "PRACTICE_NAME": name,
+            "SPECIALTY": practice.get("specialty", ""),
+            "CITY": practice.get("city", ""),
         },
-        "listIds": [BREVO_LIST_ID],
         "updateEnabled": False,
     }
-    headers = {"api-key": BREVO_API_KEY, "Content-Type": "application/json"}
     try:
         resp = requests.post(
             "https://api.brevo.com/v3/contacts",
             json=payload,
-            headers=headers,
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
             timeout=15,
         )
         if resp.status_code == 201:
             return "added"
         if resp.status_code == 400:
-            body = resp.json()
-            # Brevo returns code "duplicate_parameter" for existing contacts
-            if "duplicate" in body.get("code", "").lower():
+            code = resp.json().get("code", "")
+            if "duplicate" in code.lower():
                 return "duplicate"
-        log.warning("Brevo error %d for %s: %s", resp.status_code, email, resp.text[:200])
+        log.warning(
+            "Brevo returned %d for <%s>: %s", resp.status_code, email, resp.text[:200]
+        )
         return "error"
     except requests.RequestException as exc:
-        log.error("Brevo request failed for %s: %s", email, exc)
+        log.error("Brevo request failed for <%s>: %s", email, exc)
         return "error"
-
-
-# ---------------------------------------------------------------------------
-# Call list helpers
-# ---------------------------------------------------------------------------
-
-def append_to_call_list(row: dict) -> None:
-    """Append one row to call_list.csv, creating the file with headers if needed."""
-    if DRY_RUN:
-        log.info(
-            "[DRY RUN] Would add to call list: %s | %s | %s",
-            row["Practice Name"], row["Phone"], row["Priority"],
-        )
-        return
-
-    file_exists = os.path.isfile(CALL_LIST_CSV)
-    with open(CALL_LIST_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CALL_LIST_HEADERS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def collect_practices() -> list[dict]:
-    """
-    Run all specialty × city queries and return a deduplicated list of
-    independent-practice dicts (with place_id, name, address, specialty, city).
-    """
-    seen_ids: set[str] = set()
-    practices: list[dict] = []
+def run() -> None:
+    log.info(
+        "=== find_and_enrich starting | DRY_RUN=%s | MAX_PRACTICES=%d ===",
+        DRY_RUN, MAX_PRACTICES,
+    )
+
+    if not ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY is not set. Exiting.")
+        return
+    if not DRY_RUN:
+        if not BREVO_API_KEY:
+            log.error("BREVO_API_KEY is not set. Exiting.")
+            return
+        if not BREVO_LIST_ID:
+            log.error("BREVO_LIST_ID is not set. Exiting.")
+            return
+
+    brevo_rows: list[dict] = []
+    call_rows: list[dict] = []
+    counts = {"added": 0, "call_list": 0, "duplicate": 0, "error": 0}
+
+    # -------------------------------------------------------------------
+    # STEP 1 — Claude finds practices
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 1: Claude finding practices ---")
+    all_practices: list[dict] = []
+    seen_phones: set[str] = set()
+    seen_domains: set[str] = set()
 
     for specialty in SPECIALTIES:
         for city in CITIES:
-            query = f"{specialty} clinic {city}"
-            log.info("Searching: %s", query)
-            results = search_places(query)
-            for place in results:
-                pid = place.get("place_id", "")
-                if pid in seen_ids:
+            log.info("Querying Claude: %s in %s", specialty, city)
+            results = find_practices(specialty, city)
+
+            added = 0
+            for p in results:
+                if len(all_practices) >= MAX_PRACTICES:
+                    break
+                if is_duplicate(p, seen_phones, seen_domains):
+                    log.debug("  skip duplicate: %s", p.get("name"))
                     continue
-                name = place.get("name", "")
-                address = place.get("formatted_address", "")
-                if not is_independent_practice(name, address):
-                    log.debug("Filtered (hospital/system): %s", name)
-                    continue
-                seen_ids.add(pid)
-                practices.append({
-                    "place_id": pid,
-                    "name": name,
-                    "address": address,
-                    "specialty": specialty.title(),
-                    "city": extract_city(address),
-                })
+                register(p, seen_phones, seen_domains)
+                all_practices.append(p)
+                added += 1
 
-    return practices
+            log.info("  → %d new practices (running total: %d)", added, len(all_practices))
+            if len(all_practices) >= MAX_PRACTICES:
+                log.info("MAX_PRACTICES=%d reached, stopping search", MAX_PRACTICES)
+                break
+        if len(all_practices) >= MAX_PRACTICES:
+            break
 
+    log.info("Claude found %d unique practices", len(all_practices))
 
-def run() -> None:
-    log.info("=== find_and_enrich starting (DRY_RUN=%s, MAX=%d) ===", DRY_RUN, MAX_PRACTICES)
+    # -------------------------------------------------------------------
+    # STEP 2 — Serper fills gaps
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 2: Serper enriching gaps ---")
+    serper_key = os.getenv("SERPER_API_KEY", "")
+    enriched_count = 0
 
-    if not GOOGLE_MAPS_API_KEY:
-        log.error("GOOGLE_MAPS_API_KEY is not set. Exiting.")
-        return
-    if not DRY_RUN and not BREVO_API_KEY:
-        log.error("BREVO_API_KEY is not set. Exiting.")
-        return
-    if not DRY_RUN and not BREVO_LIST_ID:
-        log.error("BREVO_LIST_ID is not set. Exiting.")
-        return
+    if not serper_key:
+        log.info("SERPER_API_KEY not set — skipping enrichment")
+    else:
+        for p in all_practices:
+            if p.get("website") and p.get("phone"):
+                continue  # nothing to fill
+            before_website = p.get("website", "")
+            before_phone = p.get("phone", "")
+            enriched = enrich_practice(p)
+            p.update(enriched)
+            if p.get("website") != before_website or p.get("phone") != before_phone:
+                enriched_count += 1
+                log.debug("  enriched: %s", p.get("name"))
 
-    practices = collect_practices()
-    log.info("Found %d independent practices (before cap)", len(practices))
-    practices = practices[:MAX_PRACTICES]
+    log.info("Serper enriched %d practices", enriched_count)
 
-    counts = {"added": 0, "call_list": 0, "duplicate": 0, "error": 0}
+    # -------------------------------------------------------------------
+    # STEP 3 — Scrape websites for candidate emails
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 3: Scraping websites for emails ---")
 
-    for i, practice in enumerate(practices, 1):
-        name = practice["name"]
-        log.info("[%d/%d] Processing: %s", i, len(practices), name)
+    for i, p in enumerate(all_practices):
+        if i > 0:
+            time.sleep(0.5)
+        website = p.get("website", "")
+        if website:
+            emails = scrape_all_emails(website)
+            p["_candidate_emails"] = emails
+            log.debug(
+                "  %s → %d email(s) found",
+                p.get("name"), len(emails),
+            )
+        else:
+            p["_candidate_emails"] = []
 
-        # Fetch details (website, phone, reviews)
-        details = get_place_details(practice["place_id"])
-        website = details.get("website", "")
-        phone = details.get("formatted_phone_number", "")
-        reviews = details.get("reviews", [])
+    # -------------------------------------------------------------------
+    # STEP 4 — Claude validates email + phone
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 4: Claude validating contacts ---")
 
-        # Scrape for email
-        email = pick_email(website)
+    for p in all_practices:
+        emails = p.get("_candidate_emails", [])
+        phone = p.get("phone", "")
 
-        if email:
-            result = add_to_brevo(email, name, phone)
+        if not emails and not phone:
+            p["_validation"] = _null_validation("no contact info found")
+            continue
+
+        p["_validation"] = validate_contact(p, emails)
+
+        # Clear phone immediately if Claude flagged it as a fax line
+        if p["_validation"].get("phone_is_fax"):
+            log.debug("  %s: phone flagged as fax, clearing", p.get("name"))
+            p["phone"] = ""
+
+    # -------------------------------------------------------------------
+    # STEP 5 — Route to Brevo or call list
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 5: Routing ---")
+
+    for p in all_practices:
+        name = p.get("name", "Unknown")
+        v = p.get("_validation", {})
+        best_email: str | None = v.get("best_email")
+        confidence: str = v.get("email_confidence", "low")
+        phone: str = p.get("phone", "")
+
+        if best_email and confidence in ("high", "medium"):
+            result = add_to_brevo(p, best_email, confidence)
+
             if result == "added":
-                log.info("  ✓ Added to Brevo: %s <%s>", name, email)
+                print(f"✓  {name} → Brevo ({best_email}) [{confidence}]")
                 counts["added"] += 1
+                brevo_rows.append({
+                    "Practice Name": name,
+                    "Email": best_email,
+                    "Confidence": confidence,
+                    "City": p.get("city", ""),
+                    "Specialty": p.get("specialty", ""),
+                    "Phone": phone,
+                    "Website": p.get("website", ""),
+                })
             elif result == "duplicate":
-                log.info("  — Duplicate (already in Brevo): %s", email)
+                print(f"⟳  {name} → duplicate, skipped")
                 counts["duplicate"] += 1
             else:
-                log.warning("  ✗ Brevo error for %s", name)
+                print(f"✗  {name} → Brevo error")
                 counts["error"] += 1
+
         else:
-            priority = "HIGH" if reviews_suggest_high_priority(reviews) else "NORMAL"
-            append_to_call_list({
+            # Determine a human-readable reason for the call list
+            if not p.get("website") and not phone:
+                reason = "no contact info found"
+            elif v.get("phone_is_fax") and not best_email:
+                reason = "fax number only"
+            elif not best_email:
+                reason = "no email found"
+            elif confidence == "low":
+                reason = f"low confidence email — {v.get('reason', '')}".rstrip(" —")
+            else:
+                reason = v.get("reason") or "no valid email"
+
+            print(f"📞  {name} → call list ({reason})")
+            counts["call_list"] += 1
+            call_rows.append({
                 "Practice Name": name,
                 "Phone": phone,
-                "Website": website,
-                "Specialty": practice["specialty"],
-                "City": practice["city"],
-                "Priority": priority,
+                "Website": p.get("website", ""),
+                "Specialty": p.get("specialty", ""),
+                "City": p.get("city", ""),
+                "Address": p.get("address", ""),
+                "Reason": reason,
             })
-            log.info("  → Call list (%s): %s | %s", priority, name, phone)
-            counts["call_list"] += 1
 
-        time.sleep(REQUEST_DELAY)
+    # -------------------------------------------------------------------
+    # STEP 6 — Save CSVs and print summary
+    # -------------------------------------------------------------------
+    log.info("\n--- STEP 6: Saving output ---")
 
-    # Final summary
-    log.info("")
-    log.info("=== Done ===")
-    log.info("  Added to Brevo : %d", counts["added"])
-    log.info("  Added to call list : %d", counts["call_list"])
-    log.info("  Duplicates skipped : %d", counts["duplicate"])
-    log.info("  Errors             : %d", counts["error"])
-    if counts["call_list"] and not DRY_RUN:
-        log.info("  Call list saved to : %s", CALL_LIST_CSV)
+    if brevo_rows:
+        with open(BREVO_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=BREVO_HEADERS)
+            writer.writeheader()
+            writer.writerows(brevo_rows)
+
+    if call_rows:
+        with open(CALL_LIST_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CALL_LIST_HEADERS)
+            writer.writeheader()
+            writer.writerows(call_rows)
+
+    print()
+    print(
+        f"Done: {counts['added']} → Brevo | "
+        f"{counts['call_list']} → call list | "
+        f"{counts['duplicate']} duplicates | "
+        f"{counts['error']} errors"
+    )
+    if call_rows:
+        print(f"Call list saved to {CALL_LIST_CSV}")
+    if brevo_rows:
+        print(f"Brevo contacts saved to {BREVO_CSV}")
 
 
 if __name__ == "__main__":

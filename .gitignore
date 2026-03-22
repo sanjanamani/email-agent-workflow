@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 .env
 call_list.csv
+brevo_added.csv
