@@ -228,8 +228,21 @@ _validation_client: anthropic.Anthropic | None = None
 def _get_validation_client() -> anthropic.Anthropic:
     global _validation_client
     if _validation_client is None:
-        _validation_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # max_retries=0: disable SDK auto-retries so our 429 handler controls backoff
+        _validation_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=0)
     return _validation_client
+
+
+def _retry_after_secs(exc: anthropic.RateLimitError, buffer: int = 5) -> int:
+    """Read retry-after seconds from the 429 response headers (+ buffer)."""
+    try:
+        headers = exc.response.headers  # type: ignore[attr-defined]
+        val = headers.get("retry-after", "")
+        if val:
+            return int(val) + buffer
+    except Exception:
+        pass
+    return 60 + buffer  # safe fallback
 
 
 def _null_validation(reason: str) -> dict:
@@ -268,14 +281,23 @@ def validate_contacts_batch(practices: list[dict]) -> list[dict]:
         '  "reason": "one sentence"\n'
     )
 
-    try:
-        client = _get_validation_client()
-        response = client.messages.create(
+    def _call_api() -> str:
+        response = _get_validation_client().messages.create(
             model=VALIDATION_MODEL,
             max_tokens=150 * len(practices),
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(b.text for b in response.content if b.type == "text")
+        return "".join(b.text for b in response.content if b.type == "text")
+
+    try:
+        try:
+            text = _call_api()
+        except anthropic.RateLimitError as exc:
+            # NPI calls are unlimited — sleep only needed if Claude hit a rate limit
+            wait = _retry_after_secs(exc)
+            log.warning("Validation hit 429 — sleeping %ds (retry-after + 5)…", wait)
+            time.sleep(wait)
+            text = _call_api()  # one retry after sleeping
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
             log.error("Batch validation: could not find JSON array in response")
@@ -472,30 +494,33 @@ def run() -> None:
                 p.get("name"), p.get("specialty"), p.get("city"), len(all_practices),
             )
 
-    log.info("NPI found %d unique practices", len(all_practices))
+    npi_total = len(all_practices)
+    log.info("NPI found %d unique practices", npi_total)
 
     # -------------------------------------------------------------------
     # STEP 1b — Claude finds additional practices
+    # NPI calls are unlimited — sleep only needed if Claude hit a rate limit.
+    # Skip Claude entirely when NPI already returned enough results.
     # -------------------------------------------------------------------
-    log.info("\n--- STEP 1b: Claude finding additional practices ---")
-
-    for p in find_all_practices(SPECIALTIES):
-        if len(all_practices) >= MAX_PRACTICES:
-            log.info("MAX_PRACTICES=%d reached, stopping Claude search", MAX_PRACTICES)
-            break
-        if is_duplicate(p, seen_phones, seen_domains):
-            log.debug("  skip duplicate (Claude): %s", p.get("name"))
-            continue
-        register(p, seen_phones, seen_domains)
-        all_practices.append(p)
-        log.info(
-            "  [Claude] + %s (%s, %s) — total: %d",
-            p.get("name"), p.get("specialty"), p.get("city"), len(all_practices),
-        )
+    if npi_total >= 20:
+        log.info("NPI returned sufficient results (%d) — skipping Claude step", npi_total)
+    else:
+        log.info("\n--- STEP 1b: Claude finding additional practices ---")
+        for p in find_all_practices(SPECIALTIES):
+            if len(all_practices) >= MAX_PRACTICES:
+                log.info("MAX_PRACTICES=%d reached, stopping Claude search", MAX_PRACTICES)
+                break
+            if is_duplicate(p, seen_phones, seen_domains):
+                log.debug("  skip duplicate (Claude): %s", p.get("name"))
+                continue
+            register(p, seen_phones, seen_domains)
+            all_practices.append(p)
+            log.info(
+                "  [Claude] + %s (%s, %s) — total: %d",
+                p.get("name"), p.get("specialty"), p.get("city"), len(all_practices),
+            )
 
     log.info("Combined total after NPI + Claude: %d unique practices", len(all_practices))
-    log.info("Waiting 180s for token bucket to refill before validation…")
-    time.sleep(180)
 
     # -------------------------------------------------------------------
     # STEP 2 — Serper fills gaps
