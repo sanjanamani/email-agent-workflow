@@ -413,9 +413,15 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
         log.info("[DRY RUN] Would add to Brevo call list: %s [%s]", name, reason)
         return "added"
 
+    digits = normalize_phone(phone)
+    if not digits:
+        log.warning("No phone number for call-list contact %s — skipping", name)
+        return "skipped"
+
     payload = {
         "listIds": [BREVO_CALL_LIST_ID],
         "attributes": {
+            "SMS": digits,
             "PRACTICE_NAME": name,
             "PHONE": phone,
             "SPECIALTY": practice.get("specialty", ""),
