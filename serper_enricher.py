@@ -9,10 +9,13 @@ Never overwrites fields that Claude already populated.
 
 import logging
 import os
+import re
 import time
 
 import requests
 from dotenv import load_dotenv
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 load_dotenv()
 
@@ -81,5 +84,18 @@ def enrich_practice(practice: dict) -> dict:
     organic = data.get("organic", [])
     if organic and not p.get("website"):
         p["website"] = organic[0].get("link", "")
+
+    # --- Extract emails from organic snippets (no extra API call) ---
+    serper_emails: list[str] = []
+    _JUNK_DOMAINS = {"sentry.io", "example.com", "yourdomain.com", "domain.com"}
+    for result in organic:
+        for field in (result.get("snippet", ""), result.get("title", "")):
+            for m in EMAIL_RE.finditer(field):
+                addr = m.group().lower()
+                domain = addr.split("@")[-1]
+                if domain not in _JUNK_DOMAINS and not addr.endswith((".png", ".jpg")):
+                    serper_emails.append(addr)
+    if serper_emails:
+        p["_serper_emails"] = serper_emails
 
     return p
