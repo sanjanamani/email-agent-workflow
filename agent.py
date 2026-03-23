@@ -341,31 +341,34 @@ Finish with a brief summary: how many added to email list, call list, and skippe
 """
 
 # ---------------------------------------------------------------------------
-# Agentic loop
+# Agentic loop — generator core
 # ---------------------------------------------------------------------------
 
-def run_agent(goal: str) -> None:
+def run_agent_stream(goal: str):
+    """
+    Generator that runs the agentic loop and yields typed event dicts:
+
+      {"type": "status",      "message": str}
+      {"type": "text",        "content": str}           # streamed token by token
+      {"type": "tool_call",   "name": str, "input_preview": str}
+      {"type": "tool_result", "name": str, "preview": str}
+      {"type": "done",        "turns": int}
+      {"type": "error",       "message": str}
+    """
     if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY is not set")
-        sys.exit(1)
+        yield {"type": "error", "message": "ANTHROPIC_API_KEY is not set"}
+        return
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     messages: list[dict] = [{"role": "user", "content": goal}]
 
-    print(f"\n{'=' * 60}")
-    print(f"GOAL   : {goal}")
-    print(f"MODEL  : {AGENT_MODEL}")
-    print(f"DRY_RUN: {DRY_RUN}")
-    print(f"{'=' * 60}\n")
+    yield {"type": "status", "message": f"Starting | model={AGENT_MODEL} | dry_run={DRY_RUN}"}
 
     turn = 0
     while True:
         turn += 1
-        log.info("--- Agent turn %d ---", turn)
+        yield {"type": "status", "message": f"Turn {turn} — calling Claude…"}
 
-        # Stream the response so text appears in real time.
-        # Retry on 429 (rate limit, use retry-after header) and 529 (overloaded,
-        # exponential backoff 5 → 10 → 20 → 40 s).
         response = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -384,49 +387,50 @@ def run_agent(goal: str) -> None:
                             and hasattr(event, "delta")
                             and getattr(event.delta, "type", "") == "text_delta"
                         ):
-                            print(event.delta.text, end="", flush=True)
+                            yield {"type": "text", "content": event.delta.text}
                     response = stream.get_final_message()
-                break  # success — exit retry loop
+                break
 
             except anthropic.RateLimitError as exc:
                 if attempt == _MAX_RETRIES:
-                    raise
+                    yield {"type": "error", "message": f"Rate limit exceeded after {_MAX_RETRIES + 1} attempts: {exc}"}
+                    return
                 wait = _retry_after_secs(exc)
-                log.warning("Agent 429 — sleeping %ds (attempt %d/%d)…", wait, attempt + 1, _MAX_RETRIES + 1)
+                yield {"type": "status", "message": f"Rate limited — sleeping {wait}s (attempt {attempt + 1}/{_MAX_RETRIES + 1})…"}
+                log.warning("Agent 429 — sleeping %ds", wait)
                 time.sleep(wait)
 
             except anthropic.APIStatusError as exc:
                 if exc.status_code != 529 or attempt == _MAX_RETRIES:
-                    raise
-                delay = min(5 * (2 ** attempt), 60)  # 5 → 10 → 20 → 40 s
-                log.warning("Agent 529 overloaded — sleeping %ds (attempt %d/%d)…", delay, attempt + 1, _MAX_RETRIES + 1)
+                    yield {"type": "error", "message": f"API error {exc.status_code}: {exc.message}"}
+                    return
+                delay = min(5 * (2 ** attempt), 60)
+                yield {"type": "status", "message": f"API overloaded — sleeping {delay}s (attempt {attempt + 1}/{_MAX_RETRIES + 1})…"}
+                log.warning("Agent 529 — sleeping %ds", delay)
                 time.sleep(delay)
 
-        # Append the full content block list (preserves tool_use + thinking blocks)
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
-            print("\n")
-            log.info("Agent finished in %d turn(s)", turn)
-            break
+            yield {"type": "done", "turns": turn}
+            return
 
         if response.stop_reason != "tool_use":
-            log.warning("Unexpected stop_reason=%r — stopping", response.stop_reason)
-            break
+            yield {"type": "error", "message": f"Unexpected stop_reason: {response.stop_reason!r}"}
+            return
 
-        # Execute every tool call the agent requested, collect results
+        # Execute every tool call, stream results back
         tool_results: list[dict] = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
 
-            input_preview = json.dumps(block.input)[:120]
-            print(f"\n[TOOL] {block.name}({input_preview})")
+            input_preview = json.dumps(block.input)[:160]
+            yield {"type": "tool_call", "name": block.name, "input_preview": input_preview}
 
             result_str = _execute_tool(block.name, block.input)
-
-            preview = result_str[:200] + ("…" if len(result_str) > 200 else "")
-            print(f"       → {preview}")
+            preview = result_str[:300] + ("…" if len(result_str) > 300 else "")
+            yield {"type": "tool_result", "name": block.name, "preview": preview}
 
             tool_results.append({
                 "type": "tool_result",
@@ -435,6 +439,31 @@ def run_agent(goal: str) -> None:
             })
 
         messages.append({"role": "user", "content": tool_results})
+
+
+def run_agent(goal: str) -> None:
+    """CLI wrapper: runs run_agent_stream and prints to stdout."""
+    print(f"\n{'=' * 60}")
+    print(f"GOAL   : {goal}")
+    print(f"MODEL  : {AGENT_MODEL}")
+    print(f"DRY_RUN: {DRY_RUN}")
+    print(f"{'=' * 60}\n")
+
+    for event in run_agent_stream(goal):
+        t = event["type"]
+        if t == "text":
+            print(event["content"], end="", flush=True)
+        elif t == "tool_call":
+            print(f"\n[TOOL] {event['name']}({event['input_preview']})")
+        elif t == "tool_result":
+            print(f"       → {event['preview']}")
+        elif t == "status":
+            log.info(event["message"])
+        elif t == "done":
+            print(f"\n\n[Agent finished in {event['turns']} turn(s)]")
+        elif t == "error":
+            print(f"\n[ERROR] {event['message']}", file=sys.stderr)
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
