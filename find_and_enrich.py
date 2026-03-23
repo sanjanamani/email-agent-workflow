@@ -377,7 +377,7 @@ def check_brevo_exists(phone: str) -> bool:
 def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
     """Add a contact with a validated email to BREVO_LIST_ID."""
     name = practice.get("name", "")
-    phone = practice.get("phone", "")
+    phone = e164_phone(practice.get("phone", ""))
 
     if DRY_RUN:
         log.info("[DRY RUN] Would add to Brevo email list: %s <%s> [%s]", name, email, confidence)
@@ -387,12 +387,12 @@ def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
         "email": email,
         "listIds": [BREVO_LIST_ID],
         "attributes": {
-            "FIRSTNAME": "",
-            "LASTNAME": name,
-            "PHONE": phone,
             "PRACTICE_NAME": name,
+            "PHONE": phone,
             "SPECIALTY": practice.get("specialty", ""),
             "CITY": practice.get("city", ""),
+            "ADDRESS": practice.get("address", ""),
+            "WEBSITE": practice.get("website", ""),
             "CONTACT_STATUS": "email_found",
         },
         "updateEnabled": False,
@@ -584,10 +584,19 @@ def run() -> None:
         if i > 0:
             time.sleep(0.5)
         website = p.get("website", "")
+        serper_emails: list[str] = p.pop("_serper_emails", [])
         if website:
-            emails = scrape_all_emails(website)
-            p["_candidate_emails"] = emails
-            log.info("  %s → %d email(s) found  [%s]", p.get("name"), len(emails), website)
+            scraped = scrape_all_emails(website)
+            # Merge Serper-found emails with scraped ones (deduplicated)
+            combined = list(dict.fromkeys(scraped + [e for e in serper_emails if e not in scraped]))
+            p["_candidate_emails"] = combined
+            log.info(
+                "  %s → %d email(s) found (%d scraped, %d from Serper)  [%s]",
+                p.get("name"), len(combined), len(scraped), len(serper_emails), website,
+            )
+        elif serper_emails:
+            p["_candidate_emails"] = serper_emails
+            log.info("  %s → %d email(s) from Serper (no website)", p.get("name"), len(serper_emails))
         else:
             log.info("  %s → no website, skipping scrape", p.get("name"))
             p["_candidate_emails"] = []
