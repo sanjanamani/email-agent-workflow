@@ -374,10 +374,44 @@ def check_brevo_exists(phone: str) -> bool:
         return False
 
 
+def check_brevo_exists_by_email(email: str) -> bool:
+    """
+    Return True if a contact with this email already exists in Brevo.
+    Email is the primary identifier — no identifierType param needed.
+    Returns False on any error (fail open).
+    """
+    if not email:
+        return False
+    try:
+        resp = requests.get(
+            f"https://api.brevo.com/v3/contacts/{email}",
+            headers=_brevo_headers(),
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except requests.RequestException as exc:
+        log.warning("Brevo existence check failed for email %s: %s", email, exc)
+        return False
+
+
+def _contact_name(practice: dict) -> tuple[str, str]:
+    """
+    Return (firstname, lastname) for a practice contact.
+    Prefers the individual doctor name (NPI-1); falls back to splitting
+    the practice name so the fields are never blank.
+    """
+    first = practice.get("doctor_first", "")
+    last = practice.get("doctor_last", "")
+    if first or last:
+        return first, last
+    return split_name(practice.get("name", ""))
+
+
 def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
     """Add a contact with a validated email to BREVO_LIST_ID."""
     name = practice.get("name", "")
     phone = e164_phone(practice.get("phone", ""))
+    firstname, lastname = _contact_name(practice)
 
     if DRY_RUN:
         log.info("[DRY RUN] Would add to Brevo email list: %s <%s> [%s]", name, email, confidence)
@@ -387,12 +421,14 @@ def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
         "email": email,
         "listIds": [BREVO_LIST_ID],
         "attributes": {
+            "FIRSTNAME": firstname,
+            "LASTNAME": lastname,
             "PRACTICE_NAME": name,
             "PHONE": phone,
+            "WEBSITE": practice.get("website", ""),
+            "ADDRESS": practice.get("address", ""),
             "SPECIALTY": practice.get("specialty", ""),
             "CITY": practice.get("city", ""),
-            "ADDRESS": practice.get("address", ""),
-            "WEBSITE": practice.get("website", ""),
             "CONTACT_STATUS": "email_found",
         },
         "updateEnabled": False,
@@ -438,7 +474,7 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
         return "skipped"
 
     e164 = e164_phone(phone)
-    firstname, lastname = split_name(name)
+    firstname, lastname = _contact_name(practice)
 
     payload = {
         "listIds": [BREVO_CALL_LIST_ID],
@@ -448,10 +484,10 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
             "LASTNAME": lastname,
             "PRACTICE_NAME": name,
             "PHONE": e164,
+            "WEBSITE": practice.get("website", ""),
+            "ADDRESS": practice.get("address", ""),
             "SPECIALTY": practice.get("specialty", ""),
             "CITY": practice.get("city", ""),
-            "ADDRESS": practice.get("address", ""),
-            "WEBSITE": practice.get("website", ""),
             "CONTACT_STATUS": "call_needed",
             "EMAIL_FOUND": "false",
             "CALL_REASON": reason,
@@ -634,11 +670,16 @@ def run() -> None:
 
         # Dedup: check Brevo by phone before adding anything
         if phone and not DRY_RUN and check_brevo_exists(phone):
-            print(f"⟳  {name} → already in Brevo, skipping")
+            print(f"⟳  {name} → already in Brevo (phone match), skipping")
             counts["duplicate"] += 1
             continue
 
         if best_email and confidence in ("high", "medium"):
+            # Also dedup by email for the email list path
+            if not DRY_RUN and check_brevo_exists_by_email(best_email):
+                print(f"⟳  {name} → already in Brevo (email match), skipping")
+                counts["duplicate"] += 1
+                continue
             result = add_to_brevo_email_list(p, best_email, confidence)
             if result == "added":
                 print(f"✓  {name} → Brevo email list ({best_email}) [{confidence}]")

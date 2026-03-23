@@ -188,7 +188,7 @@ def _parse_result(result: dict, specialty: str, enum_type: str) -> dict | None:
     city: str = loc.get("city", "").strip().title()
     address: str = _build_address(loc)
 
-    return {
+    practice: dict = {
         "name": display_name,
         "phone": phone,
         "website": "",
@@ -197,6 +197,14 @@ def _parse_result(result: dict, specialty: str, enum_type: str) -> dict | None:
         "specialty": specialty,
         "_filter_name": filter_name,   # used by filter, stripped before returning
     }
+
+    # For individual providers (NPI-1), store the doctor's name separately
+    # so both the practice name and the contact person name reach Brevo.
+    if enum_type == "NPI-1":
+        practice["doctor_first"] = basic.get("first_name", "").strip().title()
+        practice["doctor_last"] = basic.get("last_name", "").strip().title()
+
+    return practice
 
 
 # ---------------------------------------------------------------------------
