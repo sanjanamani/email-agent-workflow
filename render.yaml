@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: email-agent-workflow
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: BREVO_LIST_ID
+        sync: false
+      - key: BREVO_CALL_LIST_ID
+        sync: false
