@@ -37,7 +37,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from claude_finder import find_all_practices, CITIES
-from npi_client import fetch_npi_practices
+from npi_client import fetch_npi_practices, is_chain_website, is_aggregator_website
 from serper_enricher import enrich_practice
 
 load_dotenv()
@@ -308,15 +308,34 @@ def validate_contacts_batch(practices: list[dict]) -> list[dict]:
         )
         return "".join(b.text for b in response.content if b.type == "text")
 
-    try:
+    _MAX_RETRIES = 3
+    text: str | None = None
+    for attempt in range(_MAX_RETRIES + 1):
         try:
             text = _call_api()
+            break
         except anthropic.RateLimitError as exc:
-            # NPI calls are unlimited — sleep only needed if Claude hit a rate limit
+            if attempt == _MAX_RETRIES:
+                log.error("Validation 429 — giving up after %d attempts", _MAX_RETRIES + 1)
+                return [_null_validation("rate limit exceeded")] * len(practices)
             wait = _retry_after_secs(exc)
-            log.warning("Validation hit 429 — sleeping %ds (retry-after + 5)…", wait)
+            log.warning("Validation 429 — sleeping %ds (attempt %d/%d)…", wait, attempt + 1, _MAX_RETRIES + 1)
             time.sleep(wait)
-            text = _call_api()  # one retry after sleeping
+        except anthropic.APIStatusError as exc:
+            if exc.status_code != 529 or attempt == _MAX_RETRIES:
+                log.error("Validation API error: %s", exc)
+                return [_null_validation(str(exc))] * len(practices)
+            delay = min(5 * (2 ** attempt), 60)  # 5 → 10 → 20 → 40 s
+            log.warning("Validation 529 overloaded — sleeping %ds (attempt %d/%d)…", delay, attempt + 1, _MAX_RETRIES + 1)
+            time.sleep(delay)
+        except anthropic.APIError as exc:
+            log.error("Batch validation error: %s", exc)
+            return [_null_validation(str(exc))] * len(practices)
+
+    if text is None:
+        return [_null_validation("all retries exhausted")] * len(practices)
+
+    try:
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
             log.error("Batch validation: could not find JSON array in response")
@@ -339,8 +358,8 @@ def validate_contacts_batch(practices: list[dict]) -> list[dict]:
             })
         return validated
 
-    except (anthropic.APIError, json.JSONDecodeError) as exc:
-        log.error("Batch validation error: %s", exc)
+    except json.JSONDecodeError as exc:
+        log.error("Batch validation JSON parse error: %s", exc)
         return [_null_validation(str(exc))] * len(practices)
 
 
@@ -610,6 +629,25 @@ def run() -> None:
                 log.debug("  enriched: %s", p.get("name"))
 
     log.info("Serper enriched %d practices", enriched_count)
+
+    # Post-enrichment domain filter: drop chain/health-system practices whose
+    # website reveals affiliation (e.g. bswhealth.com, utswmed.org, privia.com),
+    # and clear aggregator URLs (healthgrades.com, zocdoc.com, …) so we don't
+    # waste scrape budget on directory pages.
+    pre_chain = len(all_practices)
+    all_practices = [p for p in all_practices if not is_chain_website(p.get("website", ""))]
+    chain_removed = pre_chain - len(all_practices)
+    if chain_removed:
+        log.info("Removed %d practice(s) with chain/health-system website domains", chain_removed)
+
+    agg_cleared = 0
+    for p in all_practices:
+        if p.get("website") and is_aggregator_website(p["website"]):
+            log.debug("  clearing aggregator website for %s: %s", p.get("name"), p["website"])
+            p["website"] = ""
+            agg_cleared += 1
+    if agg_cleared:
+        log.info("Cleared %d aggregator/directory website(s) (won't scrape)", agg_cleared)
 
     # -------------------------------------------------------------------
     # STEP 3 — Scrape websites for candidate emails

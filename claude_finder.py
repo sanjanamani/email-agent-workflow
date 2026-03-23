@@ -103,40 +103,23 @@ def _retry_after(exc: anthropic.RateLimitError, buffer: int = 10) -> int:
     return fallback
 
 
+_MAX_RETRIES = 3
+
+
 def find_practices(specialty: str) -> list[dict]:
     """
     Use Claude (training knowledge only, no web search) to list real
     independent specialty clinics across all DFW cities.
 
     Returns a list of dicts: {name, website, phone, address, city, specialty}
-    Returns [] on any error or empty result.
+    Returns [] on any error or after all retries are exhausted.
+    Retries on 429 (rate limit, using retry-after header) and 529 (overloaded,
+    exponential backoff 5 → 10 → 20 → 40 s).
     """
     client = _get_client()
     user_content = _user_prompt(specialty)
 
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}],
-        )
-
-        text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-        if not text:
-            log.warning("No text in Claude response for %s", specialty)
-            return []
-
-        practices = _extract_json_array(text)
-        log.info("Claude found %d practices for %s", len(practices), specialty)
-        return practices
-
-    except anthropic.RateLimitError as exc:
-        wait = _retry_after(exc)
-        log.warning("Rate limited for %s. Waiting %ds (from retry-after header)…", specialty, wait)
-        time.sleep(wait)
+    for attempt in range(_MAX_RETRIES + 1):
         try:
             response = client.messages.create(
                 model=MODEL,
@@ -145,15 +128,40 @@ def find_practices(specialty: str) -> list[dict]:
                 messages=[{"role": "user", "content": user_content}],
             )
             text = "".join(b.text for b in response.content if b.type == "text")
+            if not text:
+                log.warning("No text in Claude response for %s", specialty)
+                return []
             practices = _extract_json_array(text)
-            log.info("Claude found %d practices for %s (retry)", len(practices), specialty)
+            log.info("Claude found %d practices for %s", len(practices), specialty)
             return practices
-        except anthropic.APIError as retry_exc:
-            log.error("Claude API error for %s on retry: %s", specialty, retry_exc)
+
+        except anthropic.RateLimitError as exc:
+            if attempt == _MAX_RETRIES:
+                log.error("Claude 429 for %s — giving up after %d attempts", specialty, _MAX_RETRIES + 1)
+                return []
+            wait = _retry_after(exc)
+            log.warning(
+                "Claude 429 for %s — sleeping %ds (attempt %d/%d)…",
+                specialty, wait, attempt + 1, _MAX_RETRIES + 1,
+            )
+            time.sleep(wait)
+
+        except anthropic.APIStatusError as exc:
+            if exc.status_code != 529 or attempt == _MAX_RETRIES:
+                log.error("Claude API error for %s: %s", specialty, exc)
+                return []
+            delay = min(5 * (2 ** attempt), 60)  # 5 → 10 → 20 → 40 s
+            log.warning(
+                "Claude 529 overloaded for %s — sleeping %ds (attempt %d/%d)…",
+                specialty, delay, attempt + 1, _MAX_RETRIES + 1,
+            )
+            time.sleep(delay)
+
+        except anthropic.APIError as exc:
+            log.error("Claude API error for %s: %s", specialty, exc)
             return []
-    except anthropic.APIError as exc:
-        log.error("Claude API error for %s: %s", specialty, exc)
-        return []
+
+    return []  # all retries exhausted
 
 
 def find_all_practices(specialties: list[str]) -> list[dict]:

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import anthropic
 from dotenv import load_dotenv
@@ -53,6 +54,18 @@ log = logging.getLogger(__name__)
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 AGENT_MODEL = "claude-opus-4-6"
+_MAX_RETRIES = 3
+
+
+def _retry_after_secs(exc: anthropic.RateLimitError, buffer: int = 5) -> int:
+    """Read retry-after seconds from a 429 response header (+ buffer)."""
+    try:
+        val = exc.response.headers.get("retry-after", "")  # type: ignore[attr-defined]
+        if val:
+            return int(val) + buffer
+    except Exception:
+        pass
+    return 60 + buffer
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -220,7 +233,19 @@ def _tool_enrich_practice(inp: dict) -> str:
 
 
 def _tool_scrape_website(inp: dict) -> str:
-    emails = scrape_all_emails(inp["url"])
+    from npi_client import is_aggregator_website, is_chain_website
+    url = inp["url"]
+    if is_chain_website(url):
+        return json.dumps({
+            "emails_found": [], "count": 0,
+            "skipped": "chain/health-system domain — practice is not independent",
+        })
+    if is_aggregator_website(url):
+        return json.dumps({
+            "emails_found": [], "count": 0,
+            "skipped": "aggregator/directory domain — not the practice's own website",
+        })
+    emails = scrape_all_emails(url)
     return json.dumps({"emails_found": emails, "count": len(emails)})
 
 
@@ -338,25 +363,44 @@ def run_agent(goal: str) -> None:
         turn += 1
         log.info("--- Agent turn %d ---", turn)
 
-        # Stream the response so text appears in real time
-        with client.messages.stream(
-            model=AGENT_MODEL,
-            max_tokens=16000,
-            thinking={"type": "adaptive"},
-            system=_SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        ) as stream:
-            for event in stream:
-                # Print text deltas to the terminal as they arrive
-                if (
-                    hasattr(event, "type")
-                    and event.type == "content_block_delta"
-                    and hasattr(event, "delta")
-                    and getattr(event.delta, "type", "") == "text_delta"
-                ):
-                    print(event.delta.text, end="", flush=True)
-            response = stream.get_final_message()
+        # Stream the response so text appears in real time.
+        # Retry on 429 (rate limit, use retry-after header) and 529 (overloaded,
+        # exponential backoff 5 → 10 → 20 → 40 s).
+        response = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                with client.messages.stream(
+                    model=AGENT_MODEL,
+                    max_tokens=16000,
+                    thinking={"type": "adaptive"},
+                    system=_SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                ) as stream:
+                    for event in stream:
+                        if (
+                            hasattr(event, "type")
+                            and event.type == "content_block_delta"
+                            and hasattr(event, "delta")
+                            and getattr(event.delta, "type", "") == "text_delta"
+                        ):
+                            print(event.delta.text, end="", flush=True)
+                    response = stream.get_final_message()
+                break  # success — exit retry loop
+
+            except anthropic.RateLimitError as exc:
+                if attempt == _MAX_RETRIES:
+                    raise
+                wait = _retry_after_secs(exc)
+                log.warning("Agent 429 — sleeping %ds (attempt %d/%d)…", wait, attempt + 1, _MAX_RETRIES + 1)
+                time.sleep(wait)
+
+            except anthropic.APIStatusError as exc:
+                if exc.status_code != 529 or attempt == _MAX_RETRIES:
+                    raise
+                delay = min(5 * (2 ** attempt), 60)  # 5 → 10 → 20 → 40 s
+                log.warning("Agent 529 overloaded — sleeping %ds (attempt %d/%d)…", delay, attempt + 1, _MAX_RETRIES + 1)
+                time.sleep(delay)
 
         # Append the full content block list (preserves tool_use + thinking blocks)
         messages.append({"role": "assistant", "content": response.content})
