@@ -439,9 +439,12 @@ def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
     payload = {
         "email": email,
         "listIds": [BREVO_LIST_ID],
+        "emailBlacklisted": False,
+        "smsBlacklisted": False,
         "attributes": {
             "FIRSTNAME": firstname,
             "LASTNAME": lastname,
+            "EMAIL": email,
             "PRACTICE_NAME": name,
             "PHONE": phone,
             "WEBSITE": practice.get("website", ""),
@@ -450,7 +453,7 @@ def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
             "CITY": practice.get("city", ""),
             "CONTACT_STATUS": "email_found",
         },
-        "updateEnabled": False,
+        "updateEnabled": True,
     }
     try:
         resp = requests.post(
@@ -459,10 +462,8 @@ def add_to_brevo_email_list(practice: dict, email: str, confidence: str) -> str:
             headers=_brevo_headers(),
             timeout=15,
         )
-        if resp.status_code == 201:
+        if resp.status_code in (201, 204):
             return "added"
-        if resp.status_code == 400 and "duplicate" in resp.json().get("code", "").lower():
-            return "duplicate"
         log.warning("Brevo email list returned %d for <%s>: %s", resp.status_code, email, resp.text[:200])
         return "error"
     except requests.RequestException as exc:
@@ -497,6 +498,8 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
 
     payload = {
         "listIds": [BREVO_CALL_LIST_ID],
+        "emailBlacklisted": False,
+        "smsBlacklisted": False,
         "attributes": {
             "SMS": e164,
             "FIRSTNAME": firstname,
@@ -511,7 +514,7 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
             "EMAIL_FOUND": "false",
             "CALL_REASON": reason,
         },
-        "updateEnabled": False,
+        "updateEnabled": True,
     }
     try:
         resp = requests.post(
@@ -520,10 +523,8 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
             headers=_brevo_headers(),
             timeout=15,
         )
-        if resp.status_code == 201:
+        if resp.status_code in (201, 204):
             return "added"
-        if resp.status_code == 400 and "duplicate" in resp.json().get("code", "").lower():
-            return "duplicate"
         log.warning("Brevo call list returned %d for %s: %s", resp.status_code, name, resp.text[:200])
         return "error"
     except requests.RequestException as exc:

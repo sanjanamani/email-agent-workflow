@@ -85,176 +85,196 @@ _HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Practice Outreach Agent</title>
+<title>Practice Outreach</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  body {
-    font-family: 'Inter', system-ui, sans-serif;
-    background: #0f172a;
-    color: #e2e8f0;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 2rem 1rem;
-  }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  background: #f7f7f5;
+  color: #1a1a1a;
+  min-height: 100vh;
+  padding: 40px 16px 60px;
+}
 
-  .container { width: 100%; max-width: 860px; }
+.page { max-width: 780px; margin: 0 auto; }
 
-  h1 {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: #f1f5f9;
-    margin-bottom: 0.25rem;
-  }
-  .subtitle {
-    font-size: 0.875rem;
-    color: #64748b;
-    margin-bottom: 1.75rem;
-  }
+.header { margin-bottom: 28px; }
+.header h1 { font-size: 18px; font-weight: 600; color: #111; letter-spacing: -0.01em; }
+.header p  { margin-top: 4px; font-size: 13px; color: #888; }
 
-  .input-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 12px;
-    padding: 1.25rem;
-    margin-bottom: 1.25rem;
-  }
+/* Input section */
+.card {
+  background: #fff;
+  border: 1px solid #e5e5e3;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
 
-  textarea {
-    width: 100%;
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    color: #e2e8f0;
-    font-size: 0.9375rem;
-    line-height: 1.6;
-    padding: 0.75rem 1rem;
-    resize: vertical;
-    min-height: 80px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  textarea:focus { border-color: #38bdf8; }
-  textarea::placeholder { color: #475569; }
+label { display: block; font-size: 12px; font-weight: 500; color: #555; margin-bottom: 6px; }
 
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-top: 0.75rem;
-  }
+textarea {
+  width: 100%;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #111;
+  resize: vertical;
+  min-height: 76px;
+  outline: none;
+  transition: border-color 0.12s;
+  background: #fff;
+}
+textarea:focus { border-color: #aaa; }
+textarea::placeholder { color: #bbb; }
 
-  button {
-    background: #0ea5e9;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    padding: 0.6rem 1.4rem;
-    font-size: 0.9375rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-    white-space: nowrap;
-  }
-  button:hover:not(:disabled) { background: #38bdf8; }
-  button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+.actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 
-  #stopBtn {
-    background: #475569;
-  }
-  #stopBtn:hover:not(:disabled) { background: #64748b; }
+.btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: none; border-radius: 6px; padding: 7px 14px;
+  font-family: inherit; font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: opacity 0.12s; white-space: nowrap;
+}
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: #111; color: #fff; }
+.btn-primary:not(:disabled):hover { background: #333; }
+.btn-secondary { background: #f0f0ee; color: #444; }
+.btn-secondary:not(:disabled):hover { background: #e5e5e3; }
 
-  .hint {
-    font-size: 0.78rem;
-    color: #475569;
-    margin-left: auto;
-  }
+.hint { margin-left: auto; font-size: 11px; color: #bbb; }
 
-  /* Log */
-  .log-card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 12px;
-    overflow: hidden;
-  }
-  .log-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1rem;
-    border-bottom: 1px solid #334155;
-    font-size: 0.8125rem;
-    color: #64748b;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-  #statusDot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: #334155;
-    display: inline-block;
-    margin-right: 0.4rem;
-    transition: background 0.3s;
-  }
-  #statusDot.running { background: #38bdf8; animation: pulse 1.2s infinite; }
-  #statusDot.done    { background: #4ade80; animation: none; }
-  #statusDot.error   { background: #f87171; animation: none; }
+/* Status bar */
+.status-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 0; margin-bottom: 8px;
+}
+.status-left { display: flex; align-items: center; gap: 7px; }
+.dot {
+  width: 7px; height: 7px; border-radius: 50%; background: #ccc;
+  flex-shrink: 0; transition: background 0.2s;
+}
+.dot.running { background: #111; animation: blink 1.4s ease-in-out infinite; }
+.dot.done    { background: #22c55e; }
+.dot.error   { background: #ef4444; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.4; }
-  }
+.status-label { font-size: 12px; color: #888; }
+.turn-count   { font-size: 12px; color: #bbb; }
 
-  #log {
-    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-    font-size: 0.8125rem;
-    line-height: 1.65;
-    padding: 1rem;
-    height: 540px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
+/* Activity feed */
+#feed {
+  background: #fff;
+  border: 1px solid #e5e5e3;
+  border-radius: 8px;
+  height: 520px;
+  overflow-y: auto;
+  padding: 12px 0;
+}
+#feed::-webkit-scrollbar { width: 4px; }
+#feed::-webkit-scrollbar-thumb { background: #e0e0e0; border-radius: 2px; }
 
-  /* Event colours */
-  .ev-text   { color: #e2e8f0; }
-  .ev-tool   { color: #38bdf8; }
-  .ev-result { color: #64748b; }
-  .ev-status { color: #94a3b8; font-style: italic; }
-  .ev-done   { color: #4ade80; font-weight: 600; }
-  .ev-error  { color: #f87171; font-weight: 600; }
-
-  /* Scrollbar */
-  #log::-webkit-scrollbar { width: 6px; }
-  #log::-webkit-scrollbar-track { background: transparent; }
-  #log::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+.row-status {
+  padding: 2px 16px;
+  font-size: 11px;
+  color: #bbb;
+  font-style: italic;
+}
+.row-text {
+  padding: 1px 16px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: #222;
+}
+.row-tool {
+  margin: 8px 12px 2px;
+  padding: 7px 10px;
+  background: #f7f7f5;
+  border: 1px solid #e8e8e6;
+  border-radius: 6px;
+}
+.tool-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tool-input {
+  font-family: "SF Mono", "Fira Mono", monospace;
+  font-size: 11px;
+  color: #888;
+  margin-top: 2px;
+  word-break: break-all;
+}
+.row-result {
+  margin: 0 12px 6px;
+  padding: 4px 10px;
+  font-family: "SF Mono", "Fira Mono", monospace;
+  font-size: 11px;
+  color: #aaa;
+  word-break: break-all;
+}
+.row-done {
+  margin: 10px 12px 4px;
+  padding: 8px 12px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #15803d;
+}
+.row-error {
+  margin: 10px 12px 4px;
+  padding: 8px 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #dc2626;
+}
+.empty-state {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; color: #ccc; font-size: 13px;
+}
 </style>
 </head>
 <body>
-<div class="container">
-  <h1>Practice Outreach Agent</h1>
-  <p class="subtitle">Describe what you want — the agent will find practices, check the CRM, scrape emails, and route contacts automatically.</p>
+<div class="page">
 
-  <div class="input-card">
+  <div class="header">
+    <h1>Practice Outreach</h1>
+    <p>Describe your target — the agent finds practices, checks the CRM, scrapes emails, and routes every contact automatically.</p>
+  </div>
+
+  <div class="card">
+    <label for="goal">Goal</label>
     <textarea id="goal" rows="3"
       placeholder="Find 25 independent endocrinologists and 25 orthopedic surgeon practices in Texas, private practice only, no hospital or health system affiliation"></textarea>
-    <div class="row">
-      <button id="runBtn" onclick="startRun()">&#9654; Run Agent</button>
-      <button id="stopBtn" onclick="stopRun()" disabled>&#9632; Stop</button>
-      <span class="hint">Cmd+Enter to run</span>
+    <div class="actions">
+      <button class="btn btn-primary" id="runBtn" onclick="startRun()">Run</button>
+      <button class="btn btn-secondary" id="stopBtn" onclick="stopRun()" disabled>Stop</button>
+      <span class="hint">⌘ Enter to run</span>
     </div>
   </div>
 
-  <div class="log-card">
-    <div class="log-header">
-      <span><span id="statusDot"></span><span id="statusLabel">Idle</span></span>
-      <span id="turnCount"></span>
+  <div class="status-bar">
+    <div class="status-left">
+      <div class="dot" id="dot"></div>
+      <span class="status-label" id="statusLabel">Ready</span>
     </div>
-    <div id="log"></div>
+    <span class="turn-count" id="turnCount"></span>
   </div>
+
+  <div id="feed"><div class="empty-state">Output will appear here</div></div>
+
 </div>
 
 <script>
@@ -265,43 +285,50 @@ document.getElementById('goal').addEventListener('keydown', e => {
 });
 
 function setStatus(state, label) {
-  const dot = document.getElementById('statusDot');
-  dot.className = state;
+  document.getElementById('dot').className = 'dot ' + state;
   document.getElementById('statusLabel').textContent = label;
 }
 
-function appendLine(cls, text) {
-  const log = document.getElementById('log');
-  const span = document.createElement('span');
-  span.className = cls;
-  span.textContent = text;
-  log.appendChild(span);
-  log.scrollTop = log.scrollHeight;
+function addRow(cls, html) {
+  const feed = document.getElementById('feed');
+  const empty = feed.querySelector('.empty-state');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = cls;
+  div.innerHTML = html;
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+  return div;
 }
 
-function appendInline(cls, text) {
-  const log = document.getElementById('log');
-  // Reuse the last span if it has the same class, otherwise create new
-  const last = log.lastElementChild;
-  if (last && last.className === cls) {
-    last.textContent += text;
-  } else {
-    const span = document.createElement('span');
-    span.className = cls;
-    span.textContent = text;
-    log.appendChild(span);
+// For streamed text we reuse the last row-text div
+let lastTextDiv = null;
+function appendText(text) {
+  const feed = document.getElementById('feed');
+  const empty = feed.querySelector('.empty-state');
+  if (empty) empty.remove();
+  if (!lastTextDiv) {
+    lastTextDiv = document.createElement('div');
+    lastTextDiv.className = 'row-text';
+    feed.appendChild(lastTextDiv);
   }
-  log.scrollTop = log.scrollHeight;
+  lastTextDiv.textContent += text;
+  feed.scrollTop = feed.scrollHeight;
+}
+function flushText() { lastTextDiv = null; }
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 async function startRun() {
   const goal = document.getElementById('goal').value.trim();
   if (!goal) return;
 
-  // Clear previous output
-  document.getElementById('log').innerHTML = '';
+  document.getElementById('feed').innerHTML = '<div class="empty-state">Starting…</div>';
   document.getElementById('turnCount').textContent = '';
-  setStatus('running', 'Running…');
+  lastTextDiv = null;
+  setStatus('running', 'Running');
   document.getElementById('runBtn').disabled = true;
   document.getElementById('stopBtn').disabled = false;
 
@@ -316,7 +343,7 @@ async function startRun() {
     });
 
     if (!resp.ok) {
-      appendLine('ev-error', `HTTP ${resp.status}: ${await resp.text()}\\n`);
+      addRow('row-error', 'HTTP ' + resp.status);
       setStatus('error', 'Error');
       return;
     }
@@ -329,11 +356,8 @@ async function startRun() {
       const {done, value} = await reader.read();
       if (done) break;
       buf += decoder.decode(value, {stream: true});
-
-      // Parse complete SSE lines
       const lines = buf.split('\\n');
-      buf = lines.pop(); // keep incomplete last line
-
+      buf = lines.pop();
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         let ev;
@@ -343,7 +367,8 @@ async function startRun() {
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
-      appendLine('ev-error', `\\nConnection error: ${err.message}\\n`);
+      flushText();
+      addRow('row-error', 'Connection error: ' + esc(err.message));
       setStatus('error', 'Error');
     }
   } finally {
@@ -356,7 +381,7 @@ async function startRun() {
 function stopRun() {
   if (controller) {
     controller.abort();
-    appendLine('ev-status', '\\n[Stopped by user]\\n');
+    flushText();
     setStatus('', 'Stopped');
   }
 }
@@ -364,24 +389,30 @@ function stopRun() {
 function handleEvent(ev) {
   switch (ev.type) {
     case 'text':
-      appendInline('ev-text', ev.content);
+      appendText(ev.content);
       break;
     case 'tool_call':
-      appendLine('ev-tool', `\\n⚙  ${ev.name}(${ev.input_preview})\\n`);
+      flushText();
+      addRow('row-tool',
+        '<div class="tool-name">' + esc(ev.name) + '</div>' +
+        '<div class="tool-input">' + esc(ev.input_preview) + '</div>');
       break;
     case 'tool_result':
-      appendLine('ev-result', `   → ${ev.preview}\\n`);
+      addRow('row-result', esc(ev.preview));
       break;
     case 'status':
-      appendLine('ev-status', `${ev.message}\\n`);
+      flushText();
+      addRow('row-status', esc(ev.message));
       break;
     case 'done':
-      appendLine('ev-done', `\\n✓ Done in ${ev.turns} turn(s)\\n`);
-      document.getElementById('turnCount').textContent = `${ev.turns} turns`;
+      flushText();
+      addRow('row-done', '&#10003; Done &mdash; ' + ev.turns + ' turn' + (ev.turns === 1 ? '' : 's'));
+      document.getElementById('turnCount').textContent = ev.turns + ' turns';
       setStatus('done', 'Done');
       break;
     case 'error':
-      appendLine('ev-error', `\\n✗ ${ev.message}\\n`);
+      flushText();
+      addRow('row-error', esc(ev.message));
       setStatus('error', 'Error');
       break;
   }
