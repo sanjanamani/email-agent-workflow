@@ -88,6 +88,25 @@ def normalize_phone(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
 
 
+def e164_phone(phone: str) -> str:
+    """Return E.164 format (+1XXXXXXXXXX) for a 10-digit US number."""
+    digits = normalize_phone(phone)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return digits  # return as-is if unexpected length
+
+
+def split_name(full_name: str) -> tuple[str, str]:
+    """Split 'FIRST REST...' into (firstname, lastname). Strips credentials like MD/DO."""
+    suffixes = {"MD", "DO", "DDS", "DMD", "PHD", "NP", "PA", "RN"}
+    parts = [p for p in full_name.strip().split() if p.upper() not in suffixes]
+    if not parts:
+        return full_name.strip(), ""
+    return parts[0].title(), " ".join(p.title() for p in parts[1:]) if len(parts) > 1 else ""
+
+
 def extract_domain(website: str) -> str:
     if not website:
         return ""
@@ -339,19 +358,19 @@ def check_brevo_exists(phone: str) -> bool:
     Uses GET /v3/contacts/{identifier}?identifierType=phone_number.
     Returns False on any error (fail open — better to attempt add than to skip).
     """
-    digits = normalize_phone(phone)
-    if not digits:
+    e164 = e164_phone(phone)
+    if not e164:
         return False
     try:
         resp = requests.get(
-            f"https://api.brevo.com/v3/contacts/{digits}",
+            f"https://api.brevo.com/v3/contacts/{e164}",
             params={"identifierType": "phone_number"},
             headers=_brevo_headers(),
             timeout=10,
         )
         return resp.status_code == 200
     except requests.RequestException as exc:
-        log.warning("Brevo existence check failed for phone %s: %s", digits, exc)
+        log.warning("Brevo existence check failed for phone %s: %s", e164, exc)
         return False
 
 
@@ -418,12 +437,17 @@ def add_to_brevo_call_list(practice: dict, reason: str) -> str:
         log.warning("No phone number for call-list contact %s — skipping", name)
         return "skipped"
 
+    e164 = e164_phone(phone)
+    firstname, lastname = split_name(name)
+
     payload = {
         "listIds": [BREVO_CALL_LIST_ID],
         "attributes": {
-            "SMS": digits,
+            "SMS": e164,
+            "FIRSTNAME": firstname,
+            "LASTNAME": lastname,
             "PRACTICE_NAME": name,
-            "PHONE": phone,
+            "PHONE": e164,
             "SPECIALTY": practice.get("specialty", ""),
             "CITY": practice.get("city", ""),
             "ADDRESS": practice.get("address", ""),
