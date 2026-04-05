@@ -16,6 +16,7 @@ drop hospital systems, large chains, and affiliated groups.
 
 import logging
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -74,6 +75,10 @@ _AFFILIATED_NAME_KEYWORDS: list[str] = [
     "thpg",
     "community health",
     "privia",
+    "bsw health",       # Baylor Scott & White (without "baylor" in name)
+    "bswhealth",
+    "scott & white",
+    "scott and white",
     "optum",
     "unitedhealth",
     "humana medical",
@@ -100,6 +105,74 @@ _AFFILIATED_ADDRESS_KEYWORDS: list[str] = [
     "harry hines",           # UT Southwestern main campus address
     "inwood rd",             # Parkland / Zale-Lipshy campus
 ]
+
+
+# ---------------------------------------------------------------------------
+# Website-domain affiliation filter
+# Applied AFTER Serper enriches the website field (NPI data has no website).
+# ---------------------------------------------------------------------------
+
+# Practices whose Serper-enriched website resolves to one of these domains are
+# employed by / contracted to a health-system chain → skip them entirely.
+_CHAIN_WEBSITE_DOMAINS: frozenset[str] = frozenset({
+    "bswhealth.com",            # Baylor Scott & White Health
+    "baylorhealth.com",
+    "utswmed.org",              # UT Southwestern Medical Center
+    "utsouthwestern.edu",
+    "texashealth.org",          # Texas Health Resources
+    "hcahealthcare.com",        # HCA Healthcare
+    "christushealth.org",
+    "methodisthealthsystem.org",
+    "privia.com",               # Privia Medical Group (contracted)
+    "optum.com",
+})
+
+# Serper sometimes returns a directory/listing page as a practice's "website".
+# Clear the URL (so we don't scrape it) but keep the practice in the pipeline.
+_AGGREGATOR_WEBSITE_DOMAINS: frozenset[str] = frozenset({
+    "healthgrades.com",
+    "zocdoc.com",
+    "vitals.com",
+    "webmd.com",
+    "ratemds.com",
+    "doximity.com",
+    "yelp.com",
+    "yellowpages.com",
+    "psychologytoday.com",
+    "google.com",
+    "facebook.com",
+    "linkedin.com",
+    "instagram.com",
+})
+
+
+def _website_domain(url: str) -> str:
+    """Return the bare registrable domain of *url* (strips www. prefix)."""
+    if not url:
+        return ""
+    if not url.startswith("http"):
+        url = f"https://{url}"
+    try:
+        netloc = urlparse(url).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except Exception:
+        return ""
+
+
+def is_chain_website(url: str) -> bool:
+    """Return True if *url* belongs to a known health-system chain/network."""
+    domain = _website_domain(url)
+    if not domain:
+        return False
+    return any(domain == cd or domain.endswith("." + cd) for cd in _CHAIN_WEBSITE_DOMAINS)
+
+
+def is_aggregator_website(url: str) -> bool:
+    """Return True if *url* is a directory/aggregator, not the practice's own site."""
+    domain = _website_domain(url)
+    if not domain:
+        return False
+    return any(domain == ad or domain.endswith("." + ad) for ad in _AGGREGATOR_WEBSITE_DOMAINS)
 
 
 def _contains_affiliate(text: str, keywords: list[str]) -> bool:
@@ -188,7 +261,7 @@ def _parse_result(result: dict, specialty: str, enum_type: str) -> dict | None:
     city: str = loc.get("city", "").strip().title()
     address: str = _build_address(loc)
 
-    return {
+    practice: dict = {
         "name": display_name,
         "phone": phone,
         "website": "",
@@ -197,6 +270,14 @@ def _parse_result(result: dict, specialty: str, enum_type: str) -> dict | None:
         "specialty": specialty,
         "_filter_name": filter_name,   # used by filter, stripped before returning
     }
+
+    # For individual providers (NPI-1), store the doctor's name separately
+    # so both the practice name and the contact person name reach Brevo.
+    if enum_type == "NPI-1":
+        practice["doctor_first"] = basic.get("first_name", "").strip().title()
+        practice["doctor_last"] = basic.get("last_name", "").strip().title()
+
+    return practice
 
 
 # ---------------------------------------------------------------------------
